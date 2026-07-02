@@ -3,7 +3,7 @@ import colorsys
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
     MeanOp, TransmissionOp, AbsorptionOp, VerdictOp, EvaluationColorUtil,
-    EvaluationResult, ColorSwatchView, VerdictView, LabelView, SpectrumPlotView,
+    EvaluationResult, ColorSwatchView, VerdictView, LabelView, SpectrumPlotView, MetadataField,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
 
@@ -55,14 +55,23 @@ class PumpkinOilPlugin(SpectralPlugin):
         result.addItem(ColorSwatchView(rgb, "measured"))
         result.addItem(ColorSwatchView(self.__targetRgb(), "target"))
         result.addItem(LabelView("hue %.0f°" % hue))
-        result.addItem(VerdictView(roast.value))
+        result.addItem(VerdictView(roast.value, hueDegrees=hue))
 
         step = SpectralWorkflowStep()
         step.setLabel("Result")
         step.setEvaluationResult(result)
         workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION).addToSteps(step)
 
-    # metadata / publishing: inherited pass -> 0 steps -> auto-skipped (D1)
+    def metadata(self, workflow):
+        # Plugin-declared metadata form (SPEC_workflow_persistence.md §2.3). Only `title` shows as a
+        # column in the Home workflows table.
+        return [
+            MetadataField("title", "Title", MetadataField.TEXT, showInWorkflowsTable=True, order=0),
+            MetadataField("temperature", "Roasting temperature (°C)", MetadataField.NUMBER, order=1),
+            MetadataField("dateOfRoasting", "Date of roasting", MetadataField.DATE, order=2),
+        ]
+
+    # publishing: inherited pass -> 0 steps -> auto-skipped (D1)
 
     def __measurementStep(self, role, label):
         step = SpectralWorkflowStep()
