@@ -1,7 +1,7 @@
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
     MeanOp, TransmissionOp, AbsorptionOp, SpectrumPlotView,
-    EvaluationResult, LabelView, MetricFieldView, SpectrumFeatureUtil,
+    EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
 
@@ -115,11 +115,16 @@ class DevSpectralPlugin(SpectralPlugin):
 
         # G3 — metrics as Spectrometer-setup-style rows: gray label chip + read-only value field, with the
         # meaning as a click/hover tooltip on the label (SPEC §17 / peak-ratio §6).
+        # Ratios cancel path·concentration (Beer-Lambert A=ε·c·l) → intrinsic to the oil regardless of how
+        # strongly it is diluted; the absolute absorptions do not. Mark the ratios with a bold-label style so
+        # the reader sees which numbers survive dilution (SPEC_bench_small_screen_refinements.md S5).
+        dilutionInvariant = MetricFieldViewStyle.builder().labelBold(True).build()
         result = EvaluationResult()
         result.addItem(LabelView("Pumpkin-oil peak-ratio — PROVISIONAL (uncalibrated: no good/bad "
                                  "thresholds yet)"))
         result.addItem(MetricFieldView("Greenness G", fmt(gGreen),
-            "D_Q ÷ A_green — headline quality index; higher = greener / fresher oil."))
+            "D_Q ÷ A_green — headline quality index; higher = greener / fresher oil.",
+            style=dilutionInvariant))
         result.addItem(MetricFieldView("Pigment D_Q", "%s @ %.0f nm" % (fmt(dQ), qLambda),
             "depth of the green-pigment Q-band — how much intact green pigment is present."))
         result.addItem(MetricFieldView("Browning A_blue", fmt(aBlue),
@@ -127,9 +132,11 @@ class DevSpectralPlugin(SpectralPlugin):
         result.addItem(MetricFieldView("Clarity A_green", fmt(aGreen),
             "green-window floor — rises with turbidity / darkening (sediment, heavy roast)."))
         result.addItem(MetricFieldView("Browning ratio", fmt(browning),
-            "A_blue ÷ A_green — the roast axis, isolated from pigment; higher = more browned."))
+            "A_blue ÷ A_green — the roast axis, isolated from pigment; higher = more browned.",
+            style=dilutionInvariant))
         result.addItem(MetricFieldView("G' (alt.)", fmt(gBlue),
-            "D_Q ÷ A_blue — browning-sensitive denominator (fragile on this rig)."))
+            "D_Q ÷ A_blue — browning-sensitive denominator (fragile on this rig).",
+            style=dilutionInvariant))
         if confidence:
             result.addItem(LabelView("⚠ low confidence: " + ", ".join(confidence)))
         return result
