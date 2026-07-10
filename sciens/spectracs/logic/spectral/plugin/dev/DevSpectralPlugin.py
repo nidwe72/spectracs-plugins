@@ -1,6 +1,6 @@
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
-    MeanOp, TransmissionOp, AbsorptionOp, SpectrumPlotView, CaptureView,
+    MeanOp, TransmissionOp, AbsorptionOp, SpectrumPlotView, CaptureView, SpectrumCaptureView, ReportView,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
@@ -37,12 +37,14 @@ class DevSpectralPlugin(SpectralPlugin):
 
         # Spectra: reference + sample overlaid. P5: the overlay is now DECLARED as a multi-trace
         # SpectrumPlotView (was host-drawn via SpectrumPlotWidget.addTrace) — the host renders it generically.
+        # M2 (Edwin): the PROCESSING Reference-vs-Sample overlay is also rendered in the PDF report.
         spectraStep = SpectralWorkflowStep()
         spectraStep.setLabel("Spectra")
         spectraStep.setContainer(meaned)
         spectraStep.setView(SpectrumPlotView(title="Reference vs Sample")
                             .addTrace(meaned.getSpectra()[REFERENCE], "Reference", "c")
-                            .addTrace(meaned.getSpectra()[SAMPLE], "Sample", "y"))
+                            .addTrace(meaned.getSpectra()[SAMPLE], "Sample", "y")
+                            .setShownInReport(True))
         phase.addToSteps(spectraStep)
 
         transmissionStep = SpectralWorkflowStep()
@@ -54,7 +56,10 @@ class DevSpectralPlugin(SpectralPlugin):
         absorptionStep = SpectralWorkflowStep()
         absorptionStep.setLabel("Absorption")
         absorptionStep.setContainer(absorption)
-        absorptionStep.setView(SpectrumPlotView(absorption.getSpectra()[ABSORPTION], "A(λ) = −log10(S/R)"))
+        # M2 (SPEC_bench_pdf_export.md §3): flag the PROCESSING absorption curve into the PDF report. Canonical
+        # example — it is shown HERE (PROCESSING) and appears in the report, but never in the EVALUATION GUI.
+        absorptionStep.setView(SpectrumPlotView(absorption.getSpectra()[ABSORPTION], "A(λ) = −log10(S/R)")
+                               .setShownInReport(True))
         phase.addToSteps(absorptionStep)
 
     # --- Pumpkin peak-ratio bands (HARD-CODED here for now — SPEC_pumpkin_peak_ratio_eval.md §7, Edwin #1).
@@ -83,17 +88,34 @@ class DevSpectralPlugin(SpectralPlugin):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION)
         metricsStep = SpectralWorkflowStep()
         metricsStep.setLabel("Metrics")
-        metricsStep.setEvaluationResult(self.__peakRatioResult(absorption, reference))
+        metricsResult = self.__peakRatioResult(absorption, reference)
+        # M2: flag the evaluation metrics into the PDF report (the verdict numbers a reader wants on paper).
+        for item in metricsResult.getItems():
+            item.setShownInReport(True)
+        metricsStep.setEvaluationResult(metricsResult)
         phase.addToSteps(metricsStep)
         # Q-peak dashed marker (restored from the pre-P4 host-drawn plot): the local-max λ in the Q search band.
         peak = SpectrumFeatureUtil().peakInRange(absorption, *self.Q_SEARCH)
         qLambda = peak[0] if peak is not None else 575.0
+        # M2 (Edwin): the EVALUATION band-marked absorption spectrum is also rendered in the PDF report.
         spectrumStep = SpectralWorkflowStep()
         spectrumStep.setLabel("Spectrum")
         spectrumStep.setView(SpectrumPlotView(absorption, title="A(λ) — bands")
                              .addBand(*self.BLUE_BAND).addBand(*self.GREEN_BAND).addBand(*self.Q_SEARCH)
-                             .addMarker(qLambda, "Q"))
+                             .addMarker(qLambda, "Q").setShownInReport(True))
         phase.addToSteps(spectrumStep)
+
+        # M2 (SPEC_bench_pdf_export.md §1): declare a Report step. Its ReportView surfaces as a tab in EVALUATION
+        # (beside Metrics | Spectrum) whose body the host renders with matplotlib (a preview that IS the PDF) +
+        # a Save action. The body is NOT listed here — it is the isShownInReport-flagged content across phases
+        # (the acquisition captures, the PROCESSING absorption, the metrics above). No ReportView → no tab.
+        username = getattr(workflow, "username", None)
+        reportStep = SpectralWorkflowStep()
+        reportStep.setLabel("Report")
+        reportStep.setView(ReportView(title="Measurement bench report",
+                                      subtitle=("Operator: %s" % username) if username else self.title,
+                                      embedMetadata=True))
+        phase.addToSteps(reportStep)
 
     def __peakRatioResult(self, absorption, reference) -> EvaluationResult:
         util = SpectrumFeatureUtil()
@@ -175,7 +197,19 @@ class DevSpectralPlugin(SpectralPlugin):
         step.setFrames(self.FRAMES)
         step.setMandatory(True)
         # P6: declare the acquisition capture SHELL (prompt/label/geometry). The host owns the camera; the bench
-        # currently still drives capture through its own panel (TODO P6 full capture-path migration).
+        # currently still drives capture through its own panel (TODO P6 full capture-path migration). The
+        # frame-count + exposure/auto-exposure controls stay HIDDEN (the default) — auto-exposure runs under the
+        # hood; the plugin can opt them in via setShowFramesControl/setShowExposureControls when needed.
         step.setView(CaptureView(prompt="Transmission geometry — place the sample between the bulb and the camera.",
                                  captureLabel="Capture " + label.lower(), geometry="transmission"))
+        # M2 (SPEC_bench_pdf_export.md §5b): declare that this role's captured frame belongs in the PDF report
+        # (cropped to the ROI). The plugin declares presence + flag; the HOST fills `.image` with the hardware
+        # pixels after capture, embeds it as a named attachment, and draws it on the page. Alongside it, declare
+        # the role's extracted SPECTRUM for the report (Edwin) — same host-fill pattern: the plugin flags an
+        # empty SpectrumPlotView, the host sets its `.spectrum` from the captured spectrum after acquisition.
+        captureResult = EvaluationResult()
+        captureResult.addItem(SpectrumCaptureView(caption=label + " — captured frame (ROI)",
+                                                  cropped=True).setShownInReport(True))
+        captureResult.addItem(SpectrumPlotView(title=label + " — spectrum").setShownInReport(True))
+        step.setEvaluationResult(captureResult)
         return step
