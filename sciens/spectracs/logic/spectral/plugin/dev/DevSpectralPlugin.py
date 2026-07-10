@@ -1,6 +1,6 @@
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
-    MeanOp, TransmissionOp, AbsorptionOp, SpectrumPlotView,
+    MeanOp, TransmissionOp, AbsorptionOp, SpectrumPlotView, CaptureView,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
@@ -35,11 +35,14 @@ class DevSpectralPlugin(SpectralPlugin):
 
         phase = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
 
-        # Spectra: reference + sample overlaid — carries the meaned container (both roles). No single-curve
-        # SpectrumPlotView (the bench view overlays both roles via SpectrumPlotWidget.addTrace — N3).
+        # Spectra: reference + sample overlaid. P5: the overlay is now DECLARED as a multi-trace
+        # SpectrumPlotView (was host-drawn via SpectrumPlotWidget.addTrace) — the host renders it generically.
         spectraStep = SpectralWorkflowStep()
         spectraStep.setLabel("Spectra")
         spectraStep.setContainer(meaned)
+        spectraStep.setView(SpectrumPlotView(title="Reference vs Sample")
+                            .addTrace(meaned.getSpectra()[REFERENCE], "Reference", "c")
+                            .addTrace(meaned.getSpectra()[SAMPLE], "Sample", "y"))
         phase.addToSteps(spectraStep)
 
         transmissionStep = SpectralWorkflowStep()
@@ -74,10 +77,23 @@ class DevSpectralPlugin(SpectralPlugin):
         reference = self.__findRole(workflow, REFERENCE)   # the meaned "Spectra" step carries REFERENCE
         if absorption is None or reference is None:
             return  # no absorption/reference yet -> 0 steps -> phase auto-skipped
-        step = SpectralWorkflowStep()
-        step.setLabel("Evaluation")
-        step.setEvaluationResult(self.__peakRatioResult(absorption, reference))
-        workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION).addToSteps(step)
+        # P4: EVALUATION declares TWO plugin steps — Metrics (the EvaluationResult) and Spectrum (the band-marked
+        # absorption plot). The host renders each as a step-tab; the band shading (was host-drawn in the bench's
+        # __absorptionBandsPlot) is now the plugin's declared SpectrumPlotView bands.
+        phase = workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION)
+        metricsStep = SpectralWorkflowStep()
+        metricsStep.setLabel("Metrics")
+        metricsStep.setEvaluationResult(self.__peakRatioResult(absorption, reference))
+        phase.addToSteps(metricsStep)
+        # Q-peak dashed marker (restored from the pre-P4 host-drawn plot): the local-max λ in the Q search band.
+        peak = SpectrumFeatureUtil().peakInRange(absorption, *self.Q_SEARCH)
+        qLambda = peak[0] if peak is not None else 575.0
+        spectrumStep = SpectralWorkflowStep()
+        spectrumStep.setLabel("Spectrum")
+        spectrumStep.setView(SpectrumPlotView(absorption, title="A(λ) — bands")
+                             .addBand(*self.BLUE_BAND).addBand(*self.GREEN_BAND).addBand(*self.Q_SEARCH)
+                             .addMarker(qLambda, "Q"))
+        phase.addToSteps(spectrumStep)
 
     def __peakRatioResult(self, absorption, reference) -> EvaluationResult:
         util = SpectrumFeatureUtil()
@@ -158,4 +174,8 @@ class DevSpectralPlugin(SpectralPlugin):
         step.setLabel(label)
         step.setFrames(self.FRAMES)
         step.setMandatory(True)
+        # P6: declare the acquisition capture SHELL (prompt/label/geometry). The host owns the camera; the bench
+        # currently still drives capture through its own panel (TODO P6 full capture-path migration).
+        step.setView(CaptureView(prompt="Transmission geometry — place the sample between the bulb and the camera.",
+                                 captureLabel="Capture " + label.lower(), geometry="transmission"))
         return step

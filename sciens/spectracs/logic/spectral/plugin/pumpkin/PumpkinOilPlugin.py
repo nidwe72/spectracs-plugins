@@ -3,7 +3,7 @@ import colorsys
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
     MeanOp, TransmissionOp, AbsorptionOp, VerdictOp, EvaluationColorUtil,
-    EvaluationResult, ColorSwatchView, VerdictView, LabelView, SpectrumPlotView, MetadataField,
+    EvaluationResult, ColorSwatchView, VerdictView, LabelView, SpectrumPlotView, MetadataField, CaptureView,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
 
@@ -79,6 +79,9 @@ class PumpkinOilPlugin(SpectralPlugin):
         step.setLabel(label)
         step.setFrames(self.FRAMES)
         step.setMandatory(True)
+        # P6: plugin-driven acquisition wording — the host reads captureLabel for the Measure button.
+        step.setView(CaptureView(prompt="Place the cuvette between the bulb and the camera.",
+                                 captureLabel="Capture " + label, geometry="transmission"))
         return step
 
     def __findTransmission(self, workflow):
