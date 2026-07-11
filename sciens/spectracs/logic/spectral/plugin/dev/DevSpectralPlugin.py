@@ -1,6 +1,7 @@
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
     MeanOp, TransmissionOp, AbsorptionOp, SpectrumPlotView, CaptureView, SpectrumCaptureView, ReportView,
+    LimsPublishView,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
@@ -116,6 +117,23 @@ class DevSpectralPlugin(SpectralPlugin):
                                       subtitle=("Operator: %s" % username) if username else self.title,
                                       embedMetadata=True))
         phase.addToSteps(reportStep)
+
+    def publishing(self, workflow):
+        # L6 (SPEC_lims_integration.md §3): declare a PUBLISHING "Send to LIMS" step. Its LimsPublishView
+        # carries only the plugin-owned facts — the target LIMS + this sample's type + analyses. The host
+        # renders a Publish button; on click it builds the M2 PDF and calls the server publish RPC (the client
+        # never talks to the LIMS). M1 = data upload → a single generic analysis; the per-metric analyses are a
+        # later LIMS-side concern.
+        phase = workflow.getPhase(SpectralWorkflowPhaseType.PUBLISHING)
+        step = SpectralWorkflowStep()
+        step.setLabel("Send to LIMS")
+        step.setView(LimsPublishView(
+            title="Send to LIMS",
+            sampleTypeName="Pumpkin Oil", sampleTypeCode="OIL",
+            analyses=[{"name": "Spectracs Measurement", "key": "SpectracsMeasurement",
+                       "group": "Spectroscopy"}],
+            backend="senaite", configKey="SENAITE"))
+        phase.addToSteps(step)
 
     def __peakRatioResult(self, absorption, reference) -> EvaluationResult:
         util = SpectrumFeatureUtil()
