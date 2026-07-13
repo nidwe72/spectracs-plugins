@@ -3,6 +3,7 @@ from sciens.spectracs.plugin_sdk import (
     MeanOp, TransmissionOp, AbsorptionOp, SpectrumPlotView, CaptureView, SpectrumCaptureView, ReportView,
     LimsPublishView,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
+    EvaluationColorUtil,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
 
@@ -83,6 +84,7 @@ class DevSpectralPlugin(SpectralPlugin):
         # metrics (no calibrated verdict yet — SPEC_pumpkin_peak_ratio_eval.md §4/§10 P1). Provisional.
         absorption = self.__findRole(workflow, ABSORPTION)
         reference = self.__findRole(workflow, REFERENCE)   # the meaned "Spectra" step carries REFERENCE
+        transmission = self.__findRole(workflow, TRANSMISSION)  # feeds the perceived-colour swatch row
         if absorption is None or reference is None:
             return  # no absorption/reference yet -> 0 steps -> phase auto-skipped
         # P4: EVALUATION declares TWO plugin steps — Metrics (the EvaluationResult) and Spectrum (the band-marked
@@ -92,7 +94,7 @@ class DevSpectralPlugin(SpectralPlugin):
         phase.setHint("The measurement has been evaluated.")  # SPEC_acquisition_guidance: plugin-authored
         metricsStep = SpectralWorkflowStep()
         metricsStep.setLabel("Metrics")
-        metricsResult = self.__peakRatioResult(absorption, reference)
+        metricsResult = self.__peakRatioResult(absorption, reference, transmission)
         # M2: flag the evaluation metrics into the PDF report (the verdict numbers a reader wants on paper).
         for item in metricsResult.getItems():
             item.setShownInReport(True)
@@ -139,7 +141,7 @@ class DevSpectralPlugin(SpectralPlugin):
             backend="senaite", configKey="SENAITE"))
         phase.addToSteps(step)
 
-    def __peakRatioResult(self, absorption, reference) -> EvaluationResult:
+    def __peakRatioResult(self, absorption, reference, transmission=None) -> EvaluationResult:
         util = SpectrumFeatureUtil()
 
         peak = util.peakInRange(absorption, *self.Q_SEARCH)                 # D_Q: local-max minus baseline
@@ -182,6 +184,12 @@ class DevSpectralPlugin(SpectralPlugin):
         result = EvaluationResult()
         result.addItem(LabelView("Pumpkin-oil peak-ratio — PROVISIONAL (uncalibrated: no good/bad "
                                  "thresholds yet)"))
+        # Perceived colour of the sample, as a metric-grid swatch row (no target — SPEC_plugin_driven_convergence
+        # §3 ‡ extended). The plugin computes the RGB from the transmission (same util the pumpkin plugin uses);
+        # placed inside the metric run so it aligns in the shared grid.
+        if transmission is not None:
+            rgb, _hue = EvaluationColorUtil().spectrumToRgbAndHue(transmission)
+            result.addItem(MetricFieldView("color", color=rgb))
         result.addItem(MetricFieldView("Greenness G", fmt(gGreen),
             "D_Q ÷ A_green — headline quality index; higher = greener / fresher oil.",
             style=dilutionInvariant))
