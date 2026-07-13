@@ -19,8 +19,11 @@ class PumpkinOilPlugin(SpectralPlugin):
 
     def acquisition(self, workflow):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
-        phase.addToSteps(self.__measurementStep(REFERENCE, "Isopropanol (reference)"))
-        phase.addToSteps(self.__measurementStep(SAMPLE, "+ pumpkin oil (sample)"))
+        phase.setHint("measurement complete")  # coach line once BOTH steps are captured (Edwin)
+        phase.addToSteps(self.__measurementStep(REFERENCE, "Isopropanol (reference)",
+                                                "Insert isopropanol and capture"))
+        phase.addToSteps(self.__measurementStep(SAMPLE, "+ pumpkin oil (sample)",
+                                                "select oil-tab and capture oil-dilution"))
 
     def processing(self, workflow):
         acquisition = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
@@ -34,6 +37,7 @@ class PumpkinOilPlugin(SpectralPlugin):
         absorption = AbsorptionOp().apply(meaned)      # {absorption}
 
         phase = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
+        phase.setHint("You can view the measurement results here.")  # SPEC_acquisition_guidance: plugin-authored
 
         absorptionStep = SpectralWorkflowStep()
         absorptionStep.setLabel("Absorption")
@@ -60,7 +64,9 @@ class PumpkinOilPlugin(SpectralPlugin):
         step = SpectralWorkflowStep()
         step.setLabel("Result")
         step.setEvaluationResult(result)
-        workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION).addToSteps(step)
+        phase = workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION)
+        phase.setHint("The measurement has been evaluated.")  # SPEC_acquisition_guidance: plugin-authored
+        phase.addToSteps(step)
 
     def metadata(self, workflow):
         # Plugin-declared metadata form (SPEC_workflow_persistence.md §2.3). Only `title` shows as a
@@ -73,14 +79,16 @@ class PumpkinOilPlugin(SpectralPlugin):
 
     # publishing: inherited pass -> 0 steps -> auto-skipped (D1)
 
-    def __measurementStep(self, role, label):
+    def __measurementStep(self, role, label, prompt):
         step = SpectralWorkflowStep()
         step.setRole(role)
         step.setLabel(label)
         step.setFrames(self.FRAMES)
         step.setMandatory(True)
         # P6: plugin-driven acquisition wording — the host reads captureLabel for the Measure button.
-        step.setView(CaptureView(prompt="Place the cuvette between the bulb and the camera.",
+        # SPEC_acquisition_guidance.md P4: the per-step `prompt` is now role-specific — the host surfaces it as
+        # the coach line + drives the amber next-action cue from whichever step is still uncaptured.
+        step.setView(CaptureView(prompt=prompt,
                                  captureLabel="Capture " + label, geometry="transmission"))
         return step
 

@@ -18,8 +18,9 @@ class DevSpectralPlugin(SpectralPlugin):
 
     def acquisition(self, workflow):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
-        phase.addToSteps(self.__measurementStep(REFERENCE, "Reference"))
-        phase.addToSteps(self.__measurementStep(SAMPLE, "Sample"))
+        phase.setHint("measurement complete")  # coach line once BOTH steps are captured (Edwin)
+        phase.addToSteps(self.__measurementStep(REFERENCE, "Reference", "Insert isopropanol and capture"))
+        phase.addToSteps(self.__measurementStep(SAMPLE, "Sample", "select oil-tab and capture oil-dilution"))
 
     def processing(self, workflow):
         acquisition = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
@@ -35,6 +36,7 @@ class DevSpectralPlugin(SpectralPlugin):
         absorption = AbsorptionOp().apply(meaned)      # {absorption}
 
         phase = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
+        phase.setHint("You can view the measurement results here.")  # SPEC_acquisition_guidance: plugin-authored
 
         # Spectra: reference + sample overlaid. P5: the overlay is now DECLARED as a multi-trace
         # SpectrumPlotView (was host-drawn via SpectrumPlotWidget.addTrace) — the host renders it generically.
@@ -87,6 +89,7 @@ class DevSpectralPlugin(SpectralPlugin):
         # absorption plot). The host renders each as a step-tab; the band shading (was host-drawn in the bench's
         # __absorptionBandsPlot) is now the plugin's declared SpectrumPlotView bands.
         phase = workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION)
+        phase.setHint("The measurement has been evaluated.")  # SPEC_acquisition_guidance: plugin-authored
         metricsStep = SpectralWorkflowStep()
         metricsStep.setLabel("Metrics")
         metricsResult = self.__peakRatioResult(absorption, reference)
@@ -125,6 +128,7 @@ class DevSpectralPlugin(SpectralPlugin):
         # never talks to the LIMS). M1 = data upload → a single generic analysis; the per-metric analyses are a
         # later LIMS-side concern.
         phase = workflow.getPhase(SpectralWorkflowPhaseType.PUBLISHING)
+        phase.setHint("Send the result to the laboratory if you want.")  # SPEC_acquisition_guidance: plugin-authored
         step = SpectralWorkflowStep()
         step.setLabel("Send to LIMS")
         step.setView(LimsPublishView(
@@ -208,7 +212,7 @@ class DevSpectralPlugin(SpectralPlugin):
 
     # metadata / publishing: inherited (return [] / pass) -> 0 steps -> auto-skipped
 
-    def __measurementStep(self, role, label):
+    def __measurementStep(self, role, label, prompt):
         step = SpectralWorkflowStep()
         step.setRole(role)
         step.setLabel(label)
@@ -218,7 +222,8 @@ class DevSpectralPlugin(SpectralPlugin):
         # currently still drives capture through its own panel (TODO P6 full capture-path migration). The
         # frame-count + exposure/auto-exposure controls stay HIDDEN (the default) — auto-exposure runs under the
         # hood; the plugin can opt them in via setShowFramesControl/setShowExposureControls when needed.
-        step.setView(CaptureView(prompt="Transmission geometry — place the sample between the bulb and the camera.",
+        # SPEC_acquisition_guidance.md P4: `prompt` is now role-specific (Reference vs Sample).
+        step.setView(CaptureView(prompt=prompt,
                                  captureLabel="Capture " + label.lower(), geometry="transmission"))
         # M2 (SPEC_bench_pdf_export.md §5b): declare that this role's captured frame belongs in the PDF report
         # (cropped to the ROI). The plugin declares presence + flag; the HOST fills `.image` with the hardware
