@@ -15,7 +15,8 @@ class DevSpectralPlugin(SpectralPlugin):
     # subclassed or shared by any other plugin. Injected transiently (no session codeRef).
     title = "Measurement bench (dev)"
 
-    FRAMES = 20  # default burst; the bench view may override step.frames from its frame-count dropdown (D2)
+    FRAMES = 150  # burst per capture (Edwin 2026-07-15): the bench averages 150 frames for a cleaner spectrum.
+    # CapturePanel seeds its frame count from this declared value; the frame-count dropdown (when shown) overrides.
 
     def acquisition(self, workflow):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
