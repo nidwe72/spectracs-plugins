@@ -18,7 +18,21 @@ class DevSpectralPlugin(SpectralPlugin):
     FRAMES = 150  # burst per capture (Edwin 2026-07-15): the bench averages 150 frames for a cleaner spectrum.
     # CapturePanel seeds its frame count from this declared value; the frame-count dropdown (when shown) overrides.
 
+    def declaredEvalBands(self):
+        # Every wavelength band this plugin's evaluation reads — the capture window (§9 M1) must cover them all,
+        # else clamping would starve an eval band. The host / assertion reads this generically.
+        return [self.BLUE_BAND, self.BLUE_PEAK, self.GREEN_BAND, self.Q_SEARCH, self.Q_BASELINE]
+
+    def __assertWindowCoversBands(self):
+        lo, hi = self.WAVELENGTH_MIN_NM, self.WAVELENGTH_MAX_NM
+        for bandLo, bandHi in self.declaredEvalBands():
+            if bandLo < lo or bandHi > hi:
+                raise ValueError(
+                    "SPEC_capture_quality.md §9 (M1): capture window [%g, %g] nm does not cover declared eval "
+                    "band [%g, %g] — clamping would starve it." % (lo, hi, bandLo, bandHi))
+
     def acquisition(self, workflow):
+        self.__assertWindowCoversBands()  # fail loud at build time if the clamp window can't feed the eval bands
         phase = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
         phase.setHint("measurement complete")  # coach line once BOTH steps are captured (Edwin)
         phase.addToSteps(self.__measurementStep(REFERENCE, "Reference", "Insert isopropanol and capture"))
@@ -79,6 +93,13 @@ class DevSpectralPlugin(SpectralPlugin):
     GATE_FRACTION = 0.25              # keep λ where reference >= 25% of its blue peak (trims cyan dip)
     VALUE_CEILING = 1.5               # drop saturated-Soret λ (A > 1.5)
     __EPS = 1e-3
+
+    # SPEC_capture_quality.md §9 (M1): the CFL lamp illuminates usefully only ~450–630 nm. The host HARD-CLAMPS
+    # the captured ROI to this window (via CaptureView.wavelengthMin/MaxNm) so the dead bands never enter the
+    # stored spectrum (they'd only feed the S/R floor-guard garbage). Must ⊇ every declaredEvalBand() below —
+    # asserted in acquisition().
+    WAVELENGTH_MIN_NM = 450.0
+    WAVELENGTH_MAX_NM = 630.0
 
     def evaluation(self, workflow):
         # Compose the GENERIC ops (SpectrumFeatureUtil) with the pumpkin constants above → render-only
@@ -233,7 +254,8 @@ class DevSpectralPlugin(SpectralPlugin):
         # hood; the plugin can opt them in via setShowFramesControl/setShowExposureControls when needed.
         # SPEC_acquisition_guidance.md P4: `prompt` is now role-specific (Reference vs Sample).
         step.setView(CaptureView(prompt=prompt,
-                                 captureLabel="Capture " + label.lower(), geometry="transmission"))
+                                 captureLabel="Capture " + label.lower(), geometry="transmission",
+                                 wavelengthMinNm=self.WAVELENGTH_MIN_NM, wavelengthMaxNm=self.WAVELENGTH_MAX_NM))
         # M2 (SPEC_bench_pdf_export.md §5b): declare that this role's captured frame belongs in the PDF report
         # (cropped to the ROI). The plugin declares presence + flag; the HOST fills `.image` with the hardware
         # pixels after capture, embeds it as a named attachment, and draws it on the page. Alongside it, declare
