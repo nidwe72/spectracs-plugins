@@ -98,8 +98,8 @@ class DevSpectralPlugin(SpectralPlugin):
     # the captured ROI to this window (via CaptureView.wavelengthMin/MaxNm) so the dead bands never enter the
     # stored spectrum (they'd only feed the S/R floor-guard garbage). Must ⊇ every declaredEvalBand() below —
     # asserted in acquisition().
-    WAVELENGTH_MIN_NM = 450.0
-    WAVELENGTH_MAX_NM = 630.0
+    WAVELENGTH_MIN_NM = 430.0
+    WAVELENGTH_MAX_NM = 650.0
 
     def evaluation(self, workflow):
         # Compose the GENERIC ops (SpectrumFeatureUtil) with the pumpkin constants above → render-only
