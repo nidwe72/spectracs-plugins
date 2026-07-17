@@ -1,0 +1,26 @@
+# spectracs-plugins — the plugins tier (SPEC_project_structure.md S5).
+#
+# A plugin's SOURCE imports only the sciens.spectracs.plugin_sdk façade, so at runtime a plugin needs exactly
+# what -core provides. NOT installable on its own: the repos are namespace-merged via PYTHONPATH (PEP 420), not
+# pip-installed, and everything shares spectracsPy/venv. This file exists so a consumer can read the list off
+# rather than guess.
+#
+# *** NO PySide6, NO pyqtgraph, NO opencv, NO Pyro5 *** — a plugin that needs any of those is mis-tiered.
+
+# --- inherited from spectracsPy-core (the plugin_sdk façade lives there) ---
+# See spectracsPy-core/requirements.txt for the authoritative, code-derived list + pins:
+numpy==1.26.4
+scipy==1.10.1
+colour-science==0.4.2
+rgbxy==0.5
+spectres==2.2.0
+matplotlib==3.7.1
+Pillow==9.5.0
+pypdf==6.14.2
+
+# --- plus the data tier the façade's types come from ---
+# spectracsPy-model  (SQLAlchemy + serializer/marshmallow) — Spectrum, SpectralWorkflow, the view-models
+# spectracsPy-base   (stdlib only) — Singleton
+#
+# T2 additionally exercises -core's synthesis (LedReference/OilSample), whose only optional dep is luxpy
+# (a LAZY import with a Gaussian fallback if absent) — not required for the verdict. See -core/requirements.txt.
