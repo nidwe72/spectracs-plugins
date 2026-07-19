@@ -206,12 +206,15 @@ class DevSpectralPlugin(SpectralPlugin):
         result = EvaluationResult()
         result.addItem(LabelView("Pumpkin-oil peak-ratio — PROVISIONAL (uncalibrated: no good/bad "
                                  "thresholds yet)"))
-        # Perceived colour of the sample, as a metric-grid swatch row (no target — SPEC_plugin_driven_convergence
-        # §3 ‡ extended). The plugin computes the RGB from the transmission (same util the pumpkin plugin uses);
-        # placed inside the metric run so it aligns in the shared grid.
-        if transmission is not None:
-            rgb, _hue = EvaluationColorUtil().spectrumToRgbAndHue(transmission)
-            result.addItem(MetricFieldView("color", color=rgb))
+        # Colour chips (SPEC_color_retrieval.md): five swatches, each with its HSL to the right — the perceived
+        # (transmission, dilution-dependent) and the dilution-invariant intrinsic (absorbance) colours, natural and
+        # hue-only, plus the hue-complemented intrinsic that reads green/yellow/brown. Rendered intrinsic-perceived
+        # first. Each aligns in the shared metric grid.
+        colourChips = self.__colourChips(transmission, absorption)
+        if colourChips:
+            result.addItem(LabelView("Colour"))
+            for chip in colourChips:
+                result.addItem(chip)
         result.addItem(MetricFieldView("Greenness G", fmt(gGreen),
             "D_Q ÷ A_green — headline quality index; higher = greener / fresher oil.",
             style=dilutionInvariant))
@@ -230,6 +233,45 @@ class DevSpectralPlugin(SpectralPlugin):
         if confidence:
             result.addItem(LabelView("⚠ low confidence: " + ", ".join(confidence)))
         return result
+
+    def __colourChips(self, transmission, absorption):
+        # SPEC_color_retrieval.md §1 — five chips in the settled order. Absorbance-derived colours use the sRGB
+        # converter (full gamut, no Philips-Hue clamp) with a ceiling so a T→0 spike can't dominate; transmission
+        # uses rgbxy (verdict-compatible). Each returns measured (h, s, l) in degrees/percent.
+        util = EvaluationColorUtil()
+        hslAbsorb = util.spectrumToHsl(absorption, converter="srgb", ceiling=3.0) if absorption is not None else None
+        hslPerceive = util.spectrumToHsl(transmission, converter="rgbxy") if transmission is not None else None
+        chips = [
+            self.__chip(util, "Intrinsic (perceived-family)", hslAbsorb, normalized=True, hueOffset=180.0,
+                tooltip="colorIntrinsicPerceived — the dilution-invariant intrinsic colour, hue-complemented (+180°) "
+                        "into the green-yellow-brown family."),
+            self.__chip(util, "Intrinsic · hue only", hslAbsorb, normalized=True,
+                tooltip="colorAbsorbedNormalized — the intrinsic (absorbance) hue at fixed S/L; reads blue-violet."),
+            self.__chip(util, "Perceived · hue only", hslPerceive, normalized=True,
+                tooltip="colorPerceivedNormalized — the perceived (transmission) hue at fixed S/L; shifts with dilution."),
+            self.__chip(util, "Intrinsic", hslAbsorb, normalized=False,
+                tooltip="colorAbsorbed — the literal CIE colour of the absorbance (dilution-invariant; blue-violet)."),
+            self.__chip(util, "Perceived", hslPerceive, normalized=False,
+                tooltip="colorPerceived — what the oil looks like at this dilution (moves with concentration)."),
+        ]
+        return [chip for chip in chips if chip is not None]
+
+    def __chip(self, util, label, hsl, normalized, tooltip, hueOffset=0.0):
+        # Build one colour chip (a MetricFieldView carrying swatch + HSL text). F13: skip when the source spectrum
+        # is missing. F10: a near-grey source has a meaningless hue → grey chip + "achromatic", never a fake colour.
+        if hsl is None:
+            return None
+        hue, saturation, lightness = hsl
+        if util.chroma(saturation, lightness) < EvaluationColorUtil.ACHROMATIC_CHROMA:
+            return MetricFieldView(label, value="achromatic / undefined", tooltip=tooltip, color=(128, 128, 128))
+        hue = (hue + hueOffset) % 360.0
+        if normalized:
+            rgb = util.rgbFromHsl(hue, 80.0, 50.0)
+            text = "H %.0f° · S 80%% · L 50%%" % hue
+        else:
+            rgb = util.rgbFromHsl(hue, saturation, lightness)
+            text = "H %.0f° · S %.0f%% · L %.0f%%" % (hue, saturation, lightness)
+        return MetricFieldView(label, value=text, tooltip=tooltip, color=rgb)
 
     def __findRole(self, workflow, role):
         # The meaned REFERENCE lives in the PROCESSING "Spectra" step; ABSORPTION in the absorption step.
