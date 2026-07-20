@@ -1,6 +1,7 @@
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
-    MeanOp, TransmissionOp, AbsorptionOp, SpectrumPlotView, CaptureView, SpectrumCaptureView, ReportView,
+    MeanOp, TransmissionOp, AbsorptionOp, BaselineOffsetOp, MedianFilterOp,
+    SpectrumPlotView, CaptureView, SpectrumCaptureView, ReportView,
     LimsPublishView,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     EvaluationColorUtil,
@@ -81,6 +82,21 @@ class DevSpectralPlugin(SpectralPlugin):
                                .setShownInReport(True))
         phase.addToSteps(absorptionStep)
 
+        # SPEC_capability_proof.md §7.0.1/§8.2: the processing ladder made VISIBLE — three COLOURED traces, raw
+        # (grey) -> de-spiked (orange, narrow instrument spikes removed) -> baseline-corrected (green, + flat-offset).
+        # SpectrumPlotView carries no linestyle, so colour distinguishes them; the hex/name colours are valid in
+        # BOTH renderers (pyqtgraph mkPen rejects matplotlib greys like "0.6").
+        absorptionRaw = absorption.getSpectra()[ABSORPTION]
+        despiked = self.__despikedAbsorption(absorptionRaw)
+        ladderStep = SpectralWorkflowStep()
+        ladderStep.setLabel("Absorption (raw / despiked / baseline-corrected)")
+        ladderStep.setView(SpectrumPlotView(title="A(λ) — raw → despiked → baseline-corrected (flat-offset)")
+                           .addTrace(absorptionRaw, "A raw", "#888888")
+                           .addTrace(despiked, "A despiked", "#e08000")
+                           .addTrace(self.__baselineCorrectedAbsorption(despiked), "A despiked + baseline", "g")
+                           .setShownInReport(True))
+        phase.addToSteps(ladderStep)
+
     # --- Pumpkin peak-ratio bands (HARD-CODED here for now — SPEC_pumpkin_peak_ratio_eval.md §7, Edwin #1).
     # The bench was meant generic (just absorption); it takes on these pumpkin-specifics for now. When the
     # pumpkin plugin becomes a 2nd consumer these promote to a shared feature-config (constants, not logic).
@@ -94,12 +110,12 @@ class DevSpectralPlugin(SpectralPlugin):
     VALUE_CEILING = 1.5               # drop saturated-Soret λ (A > 1.5)
     __EPS = 1e-3
 
-    # SPEC_capture_quality.md §9 (M1): the CFL lamp illuminates usefully only ~450–630 nm. The host HARD-CLAMPS
-    # the captured ROI to this window (via CaptureView.wavelengthMin/MaxNm) so the dead bands never enter the
-    # stored spectrum (they'd only feed the S/R floor-guard garbage). Must ⊇ every declaredEvalBand() below —
-    # asserted in acquisition().
-    WAVELENGTH_MIN_NM = 430.0
-    WAVELENGTH_MAX_NM = 650.0
+    # SPEC_capture_quality.md §9 (M1) / SPEC_capability_proof.md §7.0.2: the CFL lamp illuminates usefully only
+    # ~440–630 nm. The host HARD-CLAMPS the captured ROI to this window (via CaptureView.wavelengthMin/MaxNm) so
+    # the dead margins never enter the stored spectrum (they'd only feed the S/R floor-guard garbage). Must ⊇
+    # every declaredEvalBand() below — asserted in acquisition() — including the incoming PB blue band at 440.
+    WAVELENGTH_MIN_NM = 440.0
+    WAVELENGTH_MAX_NM = 630.0
 
     def evaluation(self, workflow):
         # Compose the GENERIC ops (SpectrumFeatureUtil) with the pumpkin constants above → render-only
@@ -163,39 +179,65 @@ class DevSpectralPlugin(SpectralPlugin):
             backend="senaite", configKey="SENAITE"))
         phase.addToSteps(step)
 
-    def __peakRatioResult(self, absorption, reference, transmission=None) -> EvaluationResult:
+    def __computeMetrics(self, absorption, reference):
+        # Pure peak-ratio computation on ONE absorbance spectrum. Called twice by __peakRatioResult — once on the
+        # raw absorbance, once on the flat-offset + light-SG "improved" absorbance — so every metric gets a paired
+        # raw / improved readout with identical machinery (UC1, SPEC_capability_proof.md §7.0.1). Returns None if
+        # there is no absorbance yet.
+        if absorption is None:
+            return None
         util = SpectrumFeatureUtil()
-
-        peak = util.peakInRange(absorption, *self.Q_SEARCH)                 # D_Q: local-max minus baseline
+        peak = util.peakInRange(absorption, *self.Q_SEARCH)                 # D_Q: local-max minus a LOCAL baseline
         qLambda = peak[0] if peak is not None else 575.0
+        # linearBaseline draws a straight line between the two Q_BASELINE anchors and reads it at qLambda; D_Q is the
+        # peak height ABOVE that local line. A flat offset b lifts peak and line equally, so D_Q is already b-immune
+        # (which is why its improved twin barely moves) — SPEC_capability_proof.md §7.0.1.
         baseline = util.linearBaseline(absorption, qLambda, self.Q_BASELINE[0], self.Q_BASELINE[1])
         dQ = (peak[1] - baseline) if (peak is not None and baseline is not None) else None
 
-        aGreen = util.bandMean(absorption, *self.GREEN_BAND)               # clarity / anchor
-        aBlue, _blueKept = util.referenceGatedBand(                        # browning (reference-gated)
+        aGreen = util.bandMean(absorption, *self.GREEN_BAND)               # clarity / anchor (absolute → carries b)
+        aBlue, _blueKept = util.referenceGatedBand(                        # browning (reference-gated; absolute → b)
             absorption, reference, self.BLUE_BAND[0], self.BLUE_BAND[1],
             self.GATE_FRACTION, self.VALUE_CEILING, self.BLUE_PEAK[0], self.BLUE_PEAK[1])
-
-        # Composition-level guards (the plugin's job, not the generic op's).
-        confidence = []
-        if dQ is None:
-            confidence.append("Q-band baseline gap")
-        if aBlue is None:
-            confidence.append("blue window empty/saturated")
-        if aGreen is None or aGreen < self.__EPS:
-            confidence.append("green anchor ~0")
 
         def ratio(numerator, denominator):
             if numerator is None or denominator is None:
                 return None
             return numerator / max(denominator, self.__EPS)               # near-zero denom floor
 
-        gGreen = ratio(dQ, aGreen)
-        gBlue = ratio(dQ, aBlue)
-        browning = ratio(aBlue, aGreen)
+        return {"dQ": dQ, "qLambda": qLambda, "aGreen": aGreen, "aBlue": aBlue,
+                "gGreen": ratio(dQ, aGreen), "gBlue": ratio(dQ, aBlue), "browning": ratio(aBlue, aGreen)}
+
+    def __peakRatioResult(self, absorption, reference, transmission=None) -> EvaluationResult:
+        # The processing ladder, once (single source of truth): raw → de-spike → (colour only) flat-offset + SG.
+        # METRICS use raw + DE-SPIKED (the flat-offset degrades the small band means — oilH, SPEC §7.0.1); COLOUR
+        # uses raw + IMPROVED (de-spike + flat-offset + light SG). De-spiking removes the narrow instrument spikes
+        # (blue-pump edge, registration) that are not oil.
+        despiked = self.__despikedAbsorption(absorption)
+        despikedBaseline = self.__baselineCorrectedAbsorption(despiked)
+        raw = self.__computeMetrics(absorption, reference)
+        despikedMetrics = self.__computeMetrics(despiked, reference)
+
+        # Composition-level guards (the plugin's job, not the generic op's) — read from the raw (primary) set.
+        confidence = []
+        if raw is not None:
+            if raw["dQ"] is None:
+                confidence.append("Q-band baseline gap")
+            if raw["aBlue"] is None:
+                confidence.append("blue window empty/saturated")
+            if raw["aGreen"] is None or raw["aGreen"] < self.__EPS:
+                confidence.append("green anchor ~0")
 
         def fmt(value):
             return "—" if value is None else ("%.3f" % value)
+
+        def scalar(metrics, key):
+            return fmt(metrics[key]) if metrics is not None else "—"
+
+        def dQtext(metrics):
+            if metrics is None or metrics["dQ"] is None:
+                return "— @ — nm"
+            return "%s @ %.0f nm" % (fmt(metrics["dQ"]), metrics["qLambda"])
 
         # G3 — metrics as Spectrometer-setup-style rows: gray label chip + read-only value field, with the
         # meaning as a click/hover tooltip on the label (SPEC §17 / peak-ratio §6).
@@ -206,53 +248,104 @@ class DevSpectralPlugin(SpectralPlugin):
         result = EvaluationResult()
         result.addItem(LabelView("Pumpkin-oil peak-ratio — PROVISIONAL (uncalibrated: no good/bad "
                                  "thresholds yet)"))
-        # Colour chips (SPEC_color_retrieval.md): five swatches, each with its HSL to the right — the perceived
-        # (transmission, dilution-dependent) and the dilution-invariant intrinsic (absorbance) colours, natural and
-        # hue-only, plus the hue-complemented intrinsic that reads green/yellow/brown. Rendered intrinsic-perceived
-        # first. Each aligns in the shared metric grid.
-        colourChips = self.__colourChips(transmission, absorption)
+        # Colour chips (SPEC_color_retrieval.md + capability_proof §7.0.1/§8.2): the 10-variant set — intrinsic
+        # (absorbance) then intrinsic-perceived (+180° complement) then perceived (transmission). Each intrinsic
+        # family: natural, hue-norm, · despiked, · despiked + baseline; perceived: natural + hue-norm. The processed
+        # rungs are hue-normalized so only HUE moves. Each aligns in the shared metric grid.
+        colourChips = self.__colourChips(transmission, absorption, despiked, despikedBaseline)
         if colourChips:
-            result.addItem(LabelView("Colour"))
+            result.addItem(LabelView("Colour — processed variants (despiked, baseline) are hue-normalized"))
             for chip in colourChips:
                 result.addItem(chip)
-        result.addItem(MetricFieldView("Greenness G", fmt(gGreen),
-            "D_Q ÷ A_green — headline quality index; higher = greener / fresher oil.",
-            style=dilutionInvariant))
-        result.addItem(MetricFieldView("Pigment D_Q", "%s @ %.0f nm" % (fmt(dQ), qLambda),
-            "depth of the green-pigment Q-band — how much intact green pigment is present."))
-        result.addItem(MetricFieldView("Browning A_blue", fmt(aBlue),
-            "blue-region absorption — rises with roasting / Maillard browning."))
-        result.addItem(MetricFieldView("Clarity A_green", fmt(aGreen),
-            "green-window floor — rises with turbidity / darkening (sediment, heavy roast)."))
-        result.addItem(MetricFieldView("Browning ratio", fmt(browning),
-            "A_blue ÷ A_green — the roast axis, isolated from pigment; higher = more browned.",
-            style=dilutionInvariant))
-        result.addItem(MetricFieldView("G' (alt.)", fmt(gBlue),
-            "D_Q ÷ A_blue — browning-sensitive denominator (fragile on this rig).",
-            style=dilutionInvariant))
+        # Every metric renders as a raw row + a "· despiked" twin (recomputed on the DE-SPIKED absorbance — narrow
+        # instrument spikes removed), the same twin convention as the colour chips (UC1). Flat-offset is NOT applied
+        # to the metrics (it degrades the small band means — oilH). D_Q barely moves (it already uses a local
+        # baseline, see __computeMetrics); A_blue drops where the ~473 blue-pump spike used to inflate it.
+        self.__pairMetric(result, "Greenness G", scalar(raw, "gGreen"), scalar(despikedMetrics, "gGreen"),
+            "D_Q ÷ A_green — headline quality index; higher = greener / fresher oil.", dilutionInvariant)
+        self.__pairMetric(result, "Pigment D_Q", dQtext(raw), dQtext(despikedMetrics),
+            "depth of the green-pigment Q-band — how much intact green pigment is present.")
+        self.__pairMetric(result, "Browning A_blue", scalar(raw, "aBlue"), scalar(despikedMetrics, "aBlue"),
+            "blue-region absorption — rises with roasting / Maillard browning.")
+        self.__pairMetric(result, "Clarity A_green", scalar(raw, "aGreen"), scalar(despikedMetrics, "aGreen"),
+            "green-window floor — rises with turbidity / darkening (sediment, heavy roast).")
+        self.__pairMetric(result, "Browning ratio", scalar(raw, "browning"), scalar(despikedMetrics, "browning"),
+            "A_blue ÷ A_green — the roast axis, isolated from pigment; higher = more browned.", dilutionInvariant)
+        self.__pairMetric(result, "G' (alt.)", scalar(raw, "gBlue"), scalar(despikedMetrics, "gBlue"),
+            "D_Q ÷ A_blue — browning-sensitive denominator (fragile on this rig).", dilutionInvariant)
         if confidence:
             result.addItem(LabelView("⚠ low confidence: " + ", ".join(confidence)))
         return result
 
-    def __colourChips(self, transmission, absorption):
-        # SPEC_color_retrieval.md §1 — five chips in the settled order. Absorbance-derived colours use the sRGB
-        # converter (full gamut, no Philips-Hue clamp) with a ceiling so a T→0 spike can't dominate; transmission
-        # uses rgbxy (verdict-compatible). Each returns measured (h, s, l) in degrees/percent.
+    def __pairMetric(self, result, label, rawText, despikedText, tooltip, style=None):
+        # A metric row plus its "· despiked" twin (median de-spiked absorbance), mirroring the colour-chip twin
+        # convention so the whole EVALUATION reads consistently (UC1).
+        result.addItem(MetricFieldView(label, rawText, tooltip, style=style))
+        result.addItem(MetricFieldView(label + " · despiked", despikedText,
+            tooltip + "  [median de-spiked — removes narrow instrument spikes]", style=style))
+
+    def __despikedAbsorption(self, absorption):
+        # De-spike (median, small kernel): removes narrow INSTRUMENT spikes — the lamp blue-pump edge (~473 nm) and
+        # the registration artifact (~607 nm) — while leaving the broad oil bands intact (SPEC_capability_proof.md
+        # §7.0.1). Non-destructive; the raw absorbance stays intact for the raw rows/chip/plot that share it.
+        if absorption is None:
+            return None
+        container = SpectraContainer()
+        container.addToSpectra(absorption, ABSORPTION)
+        return MedianFilterOp(kernelSize=7).apply(container).getSpectra()[ABSORPTION]
+
+    def __baselineCorrectedAbsorption(self, despikedAbsorption):
+        # Colour-only baseline correction: flat-offset (deep-red anchor-mean floor) on the ALREADY de-spiked
+        # absorbance. Removes the additive b that SHIFTS the ABSORBED chromaticity (SPEC §7.0.1). COLOUR-ONLY — it
+        # degrades the small band-mean metrics (oilH), so metrics use raw + de-spiked. NO smoothing (a near-no-op
+        # for chromaticity — colour is a spectral integral; Edwin). Non-destructive (the op deep-copies).
+        if despikedAbsorption is None:
+            return None
+        container = SpectraContainer()
+        container.addToSpectra(despikedAbsorption, ABSORPTION)
+        return BaselineOffsetOp().apply(container).getSpectra()[ABSORPTION]
+
+    def __colourChips(self, transmission, absorption, despikedAbsorption=None, despikedBaselineAbsorption=None):
+        # SPEC_color_retrieval.md §1 + capability_proof §7.0.1/§8.2 — the 10-variant colour set. Absorbance-derived
+        # colours use the sRGB converter (full gamut, no Philips-Hue clamp) with a ceiling so a T→0 spike can't
+        # dominate; transmission uses rgbxy (verdict-compatible). Each returns measured (h,s,l) deg/%. Three intrinsic
+        # processing rungs — raw, de-spiked, de-spiked+baseline — shown hue-normalized (fixed S/L) so only HUE moves;
+        # plus a natural (measured S/L) chip. Only the ABSORBED colours get the correction rungs (an additive b is a
+        # chromaticity SHIFT for absorbed, invariant for perceived). Order: intrinsic → intrinsic-perceived (+180°
+        # complement into the green-yellow-brown family) → perceived (transmission).
         util = EvaluationColorUtil()
-        hslAbsorb = util.spectrumToHsl(absorption, converter="srgb", ceiling=3.0) if absorption is not None else None
-        hslPerceive = util.spectrumToHsl(transmission, converter="rgbxy") if transmission is not None else None
+
+        def hsl(spectrum, converter, ceiling=None):
+            return util.spectrumToHsl(spectrum, converter=converter, ceiling=ceiling) if spectrum is not None else None
+
+        hslAbsorb = hsl(absorption, "srgb", 3.0)
+        hslDespiked = hsl(despikedAbsorption, "srgb", 3.0)
+        hslBaseline = hsl(despikedBaselineAbsorption, "srgb", 3.0)
+        hslPerceive = hsl(transmission, "rgbxy")
         chips = [
-            self.__chip(util, "Intrinsic (perceived-family)", hslAbsorb, normalized=True, hueOffset=180.0,
-                tooltip="colorIntrinsicPerceived — the dilution-invariant intrinsic colour, hue-complemented (+180°) "
-                        "into the green-yellow-brown family."),
-            self.__chip(util, "Intrinsic · hue only", hslAbsorb, normalized=True,
-                tooltip="colorAbsorbedNormalized — the intrinsic (absorbance) hue at fixed S/L; reads blue-violet."),
-            self.__chip(util, "Perceived · hue only", hslPerceive, normalized=True,
-                tooltip="colorPerceivedNormalized — the perceived (transmission) hue at fixed S/L; shifts with dilution."),
+            # intrinsic (absorbance)
             self.__chip(util, "Intrinsic", hslAbsorb, normalized=False,
-                tooltip="colorAbsorbed — the literal CIE colour of the absorbance (dilution-invariant; blue-violet)."),
+                tooltip="colorAbsorbed — literal CIE colour of the absorbance at measured S/L (dilution-invariant hue; reads blue-violet)."),
+            self.__chip(util, "Intrinsic · hue-norm", hslAbsorb, normalized=True,
+                tooltip="colorAbsorbed hue at fixed S/L (hue-normalized)."),
+            self.__chip(util, "Intrinsic · despiked", hslDespiked, normalized=True,
+                tooltip="colorAbsorbed hue after median de-spike (narrow instrument spikes removed), hue-normalized."),
+            self.__chip(util, "Intrinsic · despiked + baseline", hslBaseline, normalized=True,
+                tooltip="colorAbsorbed hue after de-spike then flat-offset baseline (additive b removed), hue-normalized."),
+            # intrinsic-perceived (+180° complement)
+            self.__chip(util, "Intrinsic-perceived", hslAbsorb, normalized=False, hueOffset=180.0,
+                tooltip="colorIntrinsicPerceived — intrinsic colour hue-complemented (+180°) into the green-yellow-brown family, at measured S/L."),
+            self.__chip(util, "Intrinsic-perceived · hue-norm", hslAbsorb, normalized=True, hueOffset=180.0,
+                tooltip="colorIntrinsicPerceived at fixed S/L (hue-normalized)."),
+            self.__chip(util, "Intrinsic-perceived · despiked", hslDespiked, normalized=True, hueOffset=180.0,
+                tooltip="colorIntrinsicPerceived after median de-spike, hue-normalized."),
+            self.__chip(util, "Intrinsic-perceived · despiked + baseline", hslBaseline, normalized=True, hueOffset=180.0,
+                tooltip="colorIntrinsicPerceived after de-spike then flat-offset baseline, hue-normalized."),
+            # perceived (transmission)
             self.__chip(util, "Perceived", hslPerceive, normalized=False,
                 tooltip="colorPerceived — what the oil looks like at this dilution (moves with concentration)."),
+            self.__chip(util, "Perceived · hue-norm", hslPerceive, normalized=True,
+                tooltip="colorPerceived hue at fixed S/L (hue-normalized)."),
         ]
         return [chip for chip in chips if chip is not None]
 
