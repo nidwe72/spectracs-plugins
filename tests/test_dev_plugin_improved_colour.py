@@ -12,7 +12,8 @@ Run from the spectracsPy repo root:
 import unittest
 
 from sciens.spectracs.plugin_sdk import (
-    SpectralWorkflow, SpectralWorkflowPhaseType, SpectraContainer, MetricFieldView, REFERENCE, SAMPLE,
+    SpectralWorkflow, SpectralWorkflowPhaseType, SpectraContainer, MetricFieldView, EvaluationColorUtil,
+    REFERENCE, SAMPLE, ABSORPTION,
 )
 from sciens.spectracs.model.spectral.SpectralWorkflowPhase import SpectralWorkflowPhase
 from sciens.spectracs.logic.spectral.synthesis.LedReferenceSynthesisLogicModule import LedReferenceSynthesisLogicModule
@@ -136,6 +137,24 @@ class DevPluginImprovedColourTest(unittest.TestCase):
         bands = step.getView().bands  # list of (lowNm, highNm[, label])
         windows = {(round(b[0]), round(b[1])) for b in bands}
         self.assertEqual(windows, {(440, 460), (510, 540), (560, 580)})
+
+    def test_intrinsic_perceived_chip_is_the_white_point_complement(self):
+        # SPEC_capability_proof.md option (b): the intrinsic-perceived hue must be the white-point complement of the
+        # absorbed colour, NOT the retired +180° HSL flip. Prove the plugin routes through complementViaWhitePoint.
+        workflow = self.__runPlugin()
+        proc = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
+        absorption = next(s for s in proc.getSteps().values()
+                          if s.getLabel() == "Absorption").getContainer().getSpectra()[ABSORPTION]
+        util = EvaluationColorUtil()
+        expected = round(util.complementViaWhitePoint(absorption, ceiling=3.0)[0])
+        absHue = util.spectrumToHsl(absorption, converter="srgb", ceiling=3.0)[0]
+        flip = round((absHue + 180.0) % 360.0)
+        step = self.__evalStep(workflow, "Evaluation (new)")
+        chip = next(i for i in step.getEvaluationResult().getItems()
+                    if isinstance(i, MetricFieldView) and i.label == "Intrinsic-perceived · hue-norm")
+        shown = int(chip.value.split("°")[0].replace("H", "").strip())
+        self.assertEqual(shown, expected, "chip hue must be the white-point complement")
+        self.assertNotEqual(shown, flip, "must NOT be the old +180° flip")
 
     def test_normalized_chips_use_the_calm_c_scheme_saturation_lightness(self):
         workflow = self.__runPlugin()

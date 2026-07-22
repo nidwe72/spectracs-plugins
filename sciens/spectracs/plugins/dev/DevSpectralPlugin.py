@@ -410,6 +410,16 @@ class DevSpectralPlugin(SpectralPlugin):
         hslDespiked = hsl(despikedAbsorption, "srgb", 3.0)
         hslBaseline = hsl(despikedBaselineAbsorption, "srgb", 3.0)
         hslPerceive = hsl(transmission, "rgbxy")
+
+        # Intrinsic-perceived = the COLORIMETRIC complement of the absorbed colour (SPEC_capability_proof.md option
+        # (b), 2026-07-22): reflect the absorbed chromaticity through the D65 white point — NOT a +180° HSL hue flip
+        # (which lands ~34° off the true perceived hue; the white-point complement is ~4° on K/L/M/N). One per
+        # absorbance rung, so the processed twins stay meaningful.
+        def complement(spectrum):
+            return util.complementViaWhitePoint(spectrum, ceiling=3.0) if spectrum is not None else None
+        hslIntrinsicPerceived = complement(absorption)
+        hslIPDespiked = complement(despikedAbsorption)
+        hslIPBaseline = complement(despikedBaselineAbsorption)
         chips = [
             # intrinsic (absorbance)
             self.__chip(util, "Intrinsic", hslAbsorb, normalized=False,
@@ -420,14 +430,14 @@ class DevSpectralPlugin(SpectralPlugin):
                 tooltip="colorAbsorbed hue after median de-spike (narrow instrument spikes removed), hue-normalized."),
             self.__chip(util, "Intrinsic · despiked + baseline", hslBaseline, normalized=True,
                 tooltip="colorAbsorbed hue after de-spike then flat-offset baseline (additive b removed), hue-normalized."),
-            # intrinsic-perceived (+180° complement)
-            self.__chip(util, "Intrinsic-perceived", hslAbsorb, normalized=False, hueOffset=180.0,
-                tooltip="colorIntrinsicPerceived — intrinsic colour hue-complemented (+180°) into the green-yellow-brown family, at measured S/L."),
-            self.__chip(util, "Intrinsic-perceived · hue-norm", hslAbsorb, normalized=True, hueOffset=180.0,
+            # intrinsic-perceived (colorimetric complement — reflect absorbed chromaticity through D65 white)
+            self.__chip(util, "Intrinsic-perceived", hslIntrinsicPerceived, normalized=False,
+                tooltip="colorIntrinsicPerceived — the perceived-family colour, as the colorimetric complement of the absorbed colour (absorbed chromaticity reflected through the D65 white point). Dilution-invariant; ~4° from the true perceived hue (vs ~34° for the old +180° flip)."),
+            self.__chip(util, "Intrinsic-perceived · hue-norm", hslIntrinsicPerceived, normalized=True,
                 tooltip="colorIntrinsicPerceived at fixed S/L (hue-normalized)."),
-            self.__chip(util, "Intrinsic-perceived · despiked", hslDespiked, normalized=True, hueOffset=180.0,
+            self.__chip(util, "Intrinsic-perceived · despiked", hslIPDespiked, normalized=True,
                 tooltip="colorIntrinsicPerceived after median de-spike, hue-normalized."),
-            self.__chip(util, "Intrinsic-perceived · despiked + baseline", hslBaseline, normalized=True, hueOffset=180.0,
+            self.__chip(util, "Intrinsic-perceived · despiked + baseline", hslIPBaseline, normalized=True,
                 tooltip="colorIntrinsicPerceived after de-spike then flat-offset baseline, hue-normalized."),
             # perceived (transmission)
             self.__chip(util, "Perceived", hslPerceive, normalized=False,
@@ -437,15 +447,17 @@ class DevSpectralPlugin(SpectralPlugin):
         ]
         return [chip for chip in chips if chip is not None]
 
-    def __chip(self, util, label, hsl, normalized, tooltip, hueOffset=0.0):
+    def __chip(self, util, label, hsl, normalized, tooltip):
         # Build one colour chip (a MetricFieldView carrying swatch + HSL text). F13: skip when the source spectrum
         # is missing. F10: a near-grey source has a meaningless hue → grey chip + "achromatic", never a fake colour.
+        # The intrinsic-perceived complement is now computed upstream (EvaluationColorUtil.complementViaWhitePoint),
+        # so the chip no longer applies a hue offset of its own.
         if hsl is None:
             return None
         hue, saturation, lightness = hsl
         if util.chroma(saturation, lightness) < EvaluationColorUtil.ACHROMATIC_CHROMA:
             return MetricFieldView(label, value="achromatic / undefined", tooltip=tooltip, color=(128, 128, 128))
-        hue = (hue + hueOffset) % 360.0
+        hue = hue % 360.0
         if normalized:
             rgb = util.rgbFromHsl(hue, self.__NORM_SATURATION, self.__NORM_LIGHTNESS)
             text = "H %.0f° · S %.0f%% · L %.0f%%" % (hue, self.__NORM_SATURATION, self.__NORM_LIGHTNESS)
