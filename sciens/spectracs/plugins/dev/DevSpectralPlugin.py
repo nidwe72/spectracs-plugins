@@ -22,7 +22,8 @@ class DevSpectralPlugin(SpectralPlugin):
     def declaredEvalBands(self):
         # Every wavelength band this plugin's evaluation reads — the capture window (§9 M1) must cover them all,
         # else clamping would starve an eval band. The host / assertion reads this generically.
-        return [self.BLUE_BAND, self.BLUE_PEAK, self.GREEN_BAND, self.Q_SEARCH, self.Q_BASELINE]
+        return [self.BLUE_BAND, self.BLUE_PEAK, self.GREEN_BAND, self.Q_SEARCH, self.Q_BASELINE,
+                self.PB_SORET_BAND, self.PB_Q_BAND]
 
     def __assertWindowCoversBands(self):
         lo, hi = self.WAVELENGTH_MIN_NM, self.WAVELENGTH_MAX_NM
@@ -110,6 +111,19 @@ class DevSpectralPlugin(SpectralPlugin):
     VALUE_CEILING = 1.5               # drop saturated-Soret λ (A > 1.5)
     __EPS = 1e-3
 
+    # --- PB literature bands (SPEC_capability_proof.md §2.1 / SPEC_pumpkin_peak_ratio_eval.md §1b.1, V3, Edwin
+    # 2026-07-22). The "Evaluation (new)" tab reads these NEW, literature-anchored windows as plain band MEANS
+    # (NOT the legacy peak-ratio machinery): the 440-460 Soret right-hand slope and the 560-580 Q-band, with the
+    # shared 510-540 clarity floor (= GREEN_BAND) as the stable-denominator comparison. Both new windows sit
+    # inside the 440-630 capture clamp, so no window change (they are added to declaredEvalBands below).
+    PB_SORET_BAND = (440.0, 460.0)    # Soret right-hand slope = green-pigment blue absorption
+    PB_Q_BAND = (560.0, 580.0)        # green-pigment Q-band
+
+    # Hue-normalized colour chips: a fixed, CALM S/L so only HUE varies between oils (SPEC_capability_proof.md §5,
+    # "C scheme" — Edwin 2026-07-22). Lowered from the original vivid 80/50 to a darker, less "popping" pair.
+    __NORM_SATURATION = 38.0
+    __NORM_LIGHTNESS = 34.0
+
     # SPEC_capture_quality.md §9 (M1) / SPEC_capability_proof.md §7.0.2: the CFL lamp illuminates usefully only
     # ~440–630 nm. The host HARD-CLAMPS the captured ROI to this window (via CaptureView.wavelengthMin/MaxNm) so
     # the dead margins never enter the stored spectrum (they'd only feed the S/R floor-guard garbage). Must ⊇
@@ -148,6 +162,30 @@ class DevSpectralPlugin(SpectralPlugin):
                              .addBand(*self.BLUE_BAND).addBand(*self.GREEN_BAND).addBand(*self.Q_SEARCH)
                              .addMarker(qLambda, "Q").setShownInReport(True))
         phase.addToSteps(spectrumStep)
+
+        # V3 (SPEC_capability_proof.md §2.1): a SECOND, forward-looking evaluation view — the PB literature bands
+        # (440-460 Soret / 560-580 Q) read as plain band MEANS on the DESPIKED absorbance, the pigment ratio, and
+        # the 10 colour chips DUPLICATED here at the calm C-scheme S/L. The legacy "Metrics" tab is left fully
+        # intact so the old-band numbers stay directly comparable — a tab-vs-tab "eureka" comparison (Edwin).
+        despikedAbsorption = self.__despikedAbsorption(absorption)
+        newStep = SpectralWorkflowStep()
+        newStep.setLabel("Evaluation (new)")
+        newResult = self.__newEvaluationResult(despikedAbsorption, transmission, absorption)
+        for item in newResult.getItems():
+            item.setShownInReport(True)
+        newStep.setEvaluationResult(newResult)
+        phase.addToSteps(newStep)
+
+        # A SECOND version of the A(λ) spectrum with the NEW bands marked (Edwin): the PB Soret + Q windows plus
+        # the shared 510-540 clarity floor shaded, Q local-max marked — on the same despiked curve as the metrics.
+        newPeak = SpectrumFeatureUtil().peakInRange(despikedAbsorption, *self.PB_Q_BAND)
+        newQLambda = newPeak[0] if newPeak is not None else 570.0
+        newSpectrumStep = SpectralWorkflowStep()
+        newSpectrumStep.setLabel("Spectrum (new)")
+        newSpectrumStep.setView(SpectrumPlotView(despikedAbsorption, title="A(λ) — PB bands (despiked)")
+                                .addBand(*self.PB_SORET_BAND).addBand(*self.GREEN_BAND).addBand(*self.PB_Q_BAND)
+                                .addMarker(newQLambda, "Q").setShownInReport(True))
+        phase.addToSteps(newSpectrumStep)
 
         # M2 (SPEC_bench_pdf_export.md §1): declare a Report step. Its ReportView surfaces as a tab in EVALUATION
         # (beside Metrics | Spectrum) whose body the host renders with matplotlib (a preview that IS the PDF) +
@@ -265,16 +303,66 @@ class DevSpectralPlugin(SpectralPlugin):
             "D_Q ÷ A_green — headline quality index; higher = greener / fresher oil.", dilutionInvariant)
         self.__pairMetric(result, "Pigment D_Q", dQtext(raw), dQtext(despikedMetrics),
             "depth of the green-pigment Q-band — how much intact green pigment is present.")
-        self.__pairMetric(result, "Browning A_blue", scalar(raw, "aBlue"), scalar(despikedMetrics, "aBlue"),
-            "blue-region absorption — rises with roasting / Maillard browning.")
+        self.__pairMetric(result, "Soret A_blue", scalar(raw, "aBlue"), scalar(despikedMetrics, "aBlue"),
+            "blue Soret-region absorption (450–490, legacy band) — tracks the green-pigment Soret band, "
+            "not browning (renamed from 'Browning A_blue'; §11 found the direction inverted).")
         self.__pairMetric(result, "Clarity A_green", scalar(raw, "aGreen"), scalar(despikedMetrics, "aGreen"),
             "green-window floor — rises with turbidity / darkening (sediment, heavy roast).")
-        self.__pairMetric(result, "Browning ratio", scalar(raw, "browning"), scalar(despikedMetrics, "browning"),
-            "A_blue ÷ A_green — the roast axis, isolated from pigment; higher = more browned.", dilutionInvariant)
+        self.__pairMetric(result, "Pigment ratio · legacy", scalar(raw, "browning"), scalar(despikedMetrics, "browning"),
+            "A_blue ÷ A_green-clarity on the LEGACY bands (450–490 / 510–540) — the §11 discriminator, kept for "
+            "continuity; higher = more intact pigment (renamed from 'Browning ratio', which read inverted).",
+            dilutionInvariant)
         self.__pairMetric(result, "G' (alt.)", scalar(raw, "gBlue"), scalar(despikedMetrics, "gBlue"),
             "D_Q ÷ A_blue — browning-sensitive denominator (fragile on this rig).", dilutionInvariant)
         if confidence:
             result.addItem(LabelView("⚠ low confidence: " + ", ".join(confidence)))
+        return result
+
+    def __newEvaluationResult(self, despikedAbsorption, transmission, rawAbsorption) -> EvaluationResult:
+        # V3 (SPEC_capability_proof.md §2.1) — the "Evaluation (new)" tab. The PB literature bands read as plain
+        # band MEANS (not the legacy peak-ratio machinery) on the DESPIKED absorbance. MEAN, not integral (SPEC §9,
+        # Edwin 2026-07-22): the two 20-nm bands make the Soret/Q ratio identical either way, and means keep the
+        # same unit + cross-tab comparability as the legacy A_blue/A_green — an integral would inject a bandwidth
+        # factor into the unequal-width Soret/clarity comparison. Emits: the three band means, the pigment ratio
+        # (Soret/Q = primary), a Soret/clarity safety net (stable denominator), and the 10 colour chips duplicated.
+        util = SpectrumFeatureUtil()
+        soret = util.bandMean(despikedAbsorption, *self.PB_SORET_BAND) if despikedAbsorption is not None else None
+        qBand = util.bandMean(despikedAbsorption, *self.PB_Q_BAND) if despikedAbsorption is not None else None
+        clarity = util.bandMean(despikedAbsorption, *self.GREEN_BAND) if despikedAbsorption is not None else None
+
+        def fmt(value):
+            return "—" if value is None else ("%.3f" % value)
+
+        def ratio(numerator, denominator):
+            if numerator is None or denominator is None:
+                return None
+            return numerator / max(denominator, self.__EPS)
+
+        dilutionInvariant = MetricFieldViewStyle.builder().labelBold(True).build()
+        result = EvaluationResult()
+        result.addItem(LabelView("Pumpkin oil — PB literature bands (440–460 Soret / 560–580 Q), despiked "
+                                 "absorbance · band means — PROVISIONAL (uncalibrated)"))
+        # Full 10-variant colour set, DUPLICATED from the legacy tab (identical builder → identical chips), at the
+        # calm C-scheme S/L. Placed first so the eye lands on colour, then the numbers.
+        colourChips = self.__colourChips(transmission, rawAbsorption, despikedAbsorption,
+                                         self.__baselineCorrectedAbsorption(despikedAbsorption))
+        if colourChips:
+            result.addItem(LabelView("Colour — processed variants (despiked, baseline) are hue-normalized"))
+            for chip in colourChips:
+                result.addItem(chip)
+        result.addItem(MetricFieldView("Soret · 440–460 nm", fmt(soret),
+            "mean absorbance over the 440–460 nm Soret right-hand slope (green-pigment blue absorption)."))
+        result.addItem(MetricFieldView("Q · 560–580 nm", fmt(qBand),
+            "mean absorbance over the 560–580 nm green-pigment Q-band."))
+        result.addItem(MetricFieldView("Clarity · 510–540 nm", fmt(clarity),
+            "mean absorbance over the 510–540 nm clarity floor (turbidity / darkening); the shared denominator."))
+        result.addItem(MetricFieldView("Pigment ratio", fmt(ratio(soret, qBand)),
+            "Soret ÷ Q — the two green-pigment bands; dilution-invariant (both scale with concentration). Primary "
+            "discriminator candidate. ⚠ the Q band is weak on this rig (§13/F7) — watch its run-to-run stability.",
+            style=dilutionInvariant))
+        result.addItem(MetricFieldView("Pigment ratio · clarity", fmt(ratio(soret, clarity)),
+            "Soret ÷ clarity-floor on the NEW bands (440–460 / 510–540) — the stable-denominator safety net for "
+            "the pigment ratio; dilution-invariant.", style=dilutionInvariant))
         return result
 
     def __pairMetric(self, result, label, rawText, despikedText, tooltip, style=None):
@@ -359,8 +447,8 @@ class DevSpectralPlugin(SpectralPlugin):
             return MetricFieldView(label, value="achromatic / undefined", tooltip=tooltip, color=(128, 128, 128))
         hue = (hue + hueOffset) % 360.0
         if normalized:
-            rgb = util.rgbFromHsl(hue, 80.0, 50.0)
-            text = "H %.0f° · S 80%% · L 50%%" % hue
+            rgb = util.rgbFromHsl(hue, self.__NORM_SATURATION, self.__NORM_LIGHTNESS)
+            text = "H %.0f° · S %.0f%% · L %.0f%%" % (hue, self.__NORM_SATURATION, self.__NORM_LIGHTNESS)
         else:
             rgb = util.rgbFromHsl(hue, saturation, lightness)
             text = "H %.0f° · S %.0f%% · L %.0f%%" % (hue, saturation, lightness)
