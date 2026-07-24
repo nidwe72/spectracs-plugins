@@ -2,11 +2,12 @@ from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
     MeanOp, TransmissionOp, AbsorptionOp, BaselineOffsetOp, MedianFilterOp,
     SpectrumPlotView, CaptureView, SpectrumCaptureView, ReportView,
-    LimsPublishView,
+    LimsPublishView, GaugeRender,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     EvaluationColorUtil,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
+from sciens.spectracs.plugins.dev.RoastGaugeView import RoastGaugeView
 
 
 class DevSpectralPlugin(SpectralPlugin):
@@ -209,6 +210,13 @@ class DevSpectralPlugin(SpectralPlugin):
         phase.setHint("Send the result to the laboratory if you want.")  # SPEC_acquisition_guidance: plugin-authored
         step = SpectralWorkflowStep()
         step.setLabel("Send to LIMS")
+        # SPEC_roast_ampel.md §8.6 — the end-user headline: show the verdict badge on the publish step, above the
+        # publish button. The badge is one more view-model in the step's item list (LABEL + SWATCH render).
+        pigmentRatio = self.__pigmentRatio(workflow)
+        if pigmentRatio is not None:
+            badge = EvaluationResult()
+            badge.addItem(RoastGaugeView(pigmentRatio, render=GaugeRender.LABEL | GaugeRender.SWATCH))
+            step.setEvaluationResult(badge)
         step.setView(LimsPublishView(
             title="Send to LIMS",
             sampleTypeName="Pumpkin Oil", sampleTypeCode="OIL",
@@ -216,6 +224,21 @@ class DevSpectralPlugin(SpectralPlugin):
                        "group": "Spectroscopy"}],
             backend="senaite", configKey="SENAITE"))
         phase.addToSteps(step)
+
+    def __pigmentRatio(self, workflow):
+        # SPEC_roast_ampel.md §8.6 — the Soret/Q pigment ratio on the despiked absorbance, the same value the
+        # Evaluation (new) gauge shows. Recomputed here (publishing() gets the workflow) so the phase hooks stay
+        # independent — cheap, deterministic, no cross-phase stashing.
+        absorption = self.__findRole(workflow, ABSORPTION)
+        if absorption is None:
+            return None
+        despiked = self.__despikedAbsorption(absorption)
+        util = SpectrumFeatureUtil()
+        soret = util.bandMean(despiked, *self.PB_SORET_BAND)
+        qBand = util.bandMean(despiked, *self.PB_Q_BAND)
+        if soret is None or qBand is None:
+            return None
+        return soret / max(qBand, self.__EPS)
 
     def __computeMetrics(self, absorption, reference):
         # Pure peak-ratio computation on ONE absorbance spectrum. Called twice by __peakRatioResult — once on the
@@ -340,14 +363,18 @@ class DevSpectralPlugin(SpectralPlugin):
 
         dilutionInvariant = MetricFieldViewStyle.builder().labelBold(True).build()
         result = EvaluationResult()
-        result.addItem(LabelView("Pumpkin oil — PB literature bands (440–460 Soret / 560–580 Q), despiked "
-                                 "absorbance · band means — PROVISIONAL (uncalibrated)"))
+        # SPEC_roast_ampel.md §8.5 — the Roast Ampel gauge is the FIRST item of this tab (gradient band + marker +
+        # verdict pill + value-on-swatch), driven by the same Soret/Q pigment ratio the metric row below shows.
+        pigmentRatio = ratio(soret, qBand)
+        if pigmentRatio is not None:
+            result.addItem(RoastGaugeView(pigmentRatio,
+                                          render=GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH))
         # Full 10-variant colour set, DUPLICATED from the legacy tab (identical builder → identical chips), at the
-        # calm C-scheme S/L. Placed first so the eye lands on colour, then the numbers.
+        # calm C-scheme S/L. Placed first so the eye lands on colour, then the numbers. (Header labels removed
+        # 2026-07-24, Edwin — the gauge row + the metric rows are self-explanatory.)
         colourChips = self.__colourChips(transmission, rawAbsorption, despikedAbsorption,
                                          self.__baselineCorrectedAbsorption(despikedAbsorption))
         if colourChips:
-            result.addItem(LabelView("Colour — processed variants (despiked, baseline) are hue-normalized"))
             for chip in colourChips:
                 result.addItem(chip)
         result.addItem(MetricFieldView("Soret · 440–460 nm", fmt(soret),
