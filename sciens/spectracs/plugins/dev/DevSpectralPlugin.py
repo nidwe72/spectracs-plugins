@@ -4,7 +4,8 @@ from sciens.spectracs.plugin_sdk import (
     SpectrumPlotView, CaptureView, SpectrumCaptureView, ReportView,
     LimsPublishView, GaugeRender,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
-    EvaluationColorUtil,
+    EvaluationColorUtil, MetadataField,
+    NavigationMode, NavigationPolicy, WorkflowPolicy,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
 from sciens.spectracs.plugins.dev.RoastGaugeView import RoastGaugeView
@@ -16,6 +17,12 @@ class DevSpectralPlugin(SpectralPlugin):
     # mean -> transmission -> absorption — but WITHOUT any use-case evaluation/verdict. Standalone; not
     # subclassed or shared by any other plugin. Injected transiently (no session codeRef).
     title = "Measurement bench (dev)"
+
+    # SPEC_simplified_plugin_navigation.md (M3) — the "should-be" end-user-mirroring presentation, driven ENTIRELY
+    # by the plugin. TEMPORARY test toggle: flip to False to run the old step-through navigation for a regression
+    # check; removed once verified. Selects, together: auto-advance nav + per-step (Reference/Sample) chevrons +
+    # the cropped-ROI capture preview. The METADATA phase is declared unconditionally (it is a permanent addition).
+    SIMPLIFIED_NAVIGATION = True
 
     FRAMES = 150  # burst per capture (Edwin 2026-07-15): the bench averages 150 frames for a cleaner spectrum.
     # CapturePanel seeds its frame count from this declared value; the frame-count dropdown (when shown) overrides.
@@ -33,6 +40,22 @@ class DevSpectralPlugin(SpectralPlugin):
                 raise ValueError(
                     "SPEC_capture_quality.md §9 (M1): capture window [%g, %g] nm does not cover declared eval "
                     "band [%g, %g] — clamping would starve it." % (lo, hi, bandLo, bandHi))
+
+    def policy(self):
+        # Cross-cutting flow policy (M3). should-be = AUTO_ADVANCE + Reference/Sample chevrons; else today's STEP.
+        if self.SIMPLIFIED_NAVIGATION:
+            return WorkflowPolicy(navigation=NavigationPolicy(
+                NavigationMode.AUTO_ADVANCE, stepChevronPhases={SpectralWorkflowPhaseType.ACQUISITION}))
+        return WorkflowPolicy.default()
+
+    def metadata(self, workflow):
+        # Change C — the METADATA form, taken over from PumpkinOilPlugin. The user lands here after measuring
+        # (the auto-advance jump halts on the required form), then Next -> PUBLISHING.
+        return [
+            MetadataField("title", "Title", MetadataField.TEXT, showInWorkflowsTable=True, order=0),
+            MetadataField("temperature", "Roasting temperature (°C)", MetadataField.NUMBER, order=1),
+            MetadataField("dateOfRoasting", "Date of roasting", MetadataField.DATE, order=2),
+        ]
 
     def acquisition(self, workflow):
         self.__assertWindowCoversBands()  # fail loud at build time if the clamp window can't feed the eval bands
@@ -519,7 +542,8 @@ class DevSpectralPlugin(SpectralPlugin):
         # SPEC_acquisition_guidance.md P4: `prompt` is now role-specific (Reference vs Sample).
         step.setView(CaptureView(prompt=prompt,
                                  captureLabel="Capture " + label.lower(), geometry="transmission",
-                                 wavelengthMinNm=self.WAVELENGTH_MIN_NM, wavelengthMaxNm=self.WAVELENGTH_MAX_NM))
+                                 wavelengthMinNm=self.WAVELENGTH_MIN_NM, wavelengthMaxNm=self.WAVELENGTH_MAX_NM,
+                                 croppedPreview=self.SIMPLIFIED_NAVIGATION))  # Change A: cropped-ROI live preview
         # M2 (SPEC_bench_pdf_export.md §5b): declare that this role's captured frame belongs in the PDF report
         # (cropped to the ROI). The plugin declares presence + flag; the HOST fills `.image` with the hardware
         # pixels after capture, embeds it as a named attachment, and draws it on the page. Alongside it, declare
