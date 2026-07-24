@@ -79,7 +79,7 @@ class VerdictGaugeViewTest(unittest.TestCase):
         self.assertEqual(view.verdictLabel, "good — green")
         # swatch colour is the gradient at the value on the plugin's OWN anchors (read off the view)
         self.assertEqual(view.swatchColor, GaugeColorUtil().gradientColorAt(view.value, view.gradientAnchors))
-        self.assertEqual(view.bandLeft, 4.5)
+        self.assertEqual(view.bandLeft, 5.0)
         self.assertEqual(view.bandRight, 2.0)
 
     def test_brown_value_caches_brown_verdict(self):
@@ -98,6 +98,19 @@ class VerdictGaugeViewTest(unittest.TestCase):
     def test_render_flags_are_additive(self):
         self.assertEqual(RoastGaugeView(3.0, GaugeRender.LABEL | GaugeRender.SWATCH).render.toNames(),
                          ["label", "swatch"])
+
+    def test_zones_render_flag_round_trips(self):
+        view = RoastGaugeView(3.0, GaugeRender.LABEL | GaugeRender.ZONES)
+        self.assertEqual(view.render.toNames(), ["label", "zones"])
+        rebuilt = ViewModelFactory.fromJson(view.toJson())
+        self.assertEqual(rebuilt.render, GaugeRender.LABEL | GaugeRender.ZONES)
+
+    def test_zone_marker_position_symbolic_halves(self):
+        # 2 classes → 2 equal halves split at 2.8; a green value sits in the left half, brown in the right
+        util = GaugeColorUtil()
+        self.assertLess(util.zoneMarkerPosition(4.0, [2.8], 5.0, 2.0), 0.5)     # good → green half
+        self.assertGreater(util.zoneMarkerPosition(2.45, [2.8], 5.0, 2.0), 0.5)  # brown → red half
+        self.assertAlmostEqual(util.zoneMarkerPosition(2.8, [2.8], 5.0, 2.0), 0.5, places=6)  # on the join
 
 
 class DevPluginGaugeWiringTest(unittest.TestCase):
@@ -147,7 +160,7 @@ class DevPluginGaugeWiringTest(unittest.TestCase):
         badgeItems = step.getEvaluationResult().getItems()
         self.assertEqual(len(badgeItems), 1)
         self.assertIsInstance(badgeItems[0], VerdictGaugeView)
-        self.assertEqual(badgeItems[0].render, GaugeRender.LABEL | GaugeRender.SWATCH)
+        self.assertEqual(badgeItems[0].render, GaugeRender.LABEL | GaugeRender.ZONES)
 
     def test_badge_value_matches_the_evaluation_gauge(self):
         workflow = self.__runPlugin()

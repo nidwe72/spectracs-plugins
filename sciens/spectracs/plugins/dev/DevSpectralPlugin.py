@@ -214,8 +214,10 @@ class DevSpectralPlugin(SpectralPlugin):
         # publish button. The badge is one more view-model in the step's item list (LABEL + SWATCH render).
         pigmentRatio = self.__pigmentRatio(workflow)
         if pigmentRatio is not None:
+            # SPEC_roast_ampel.md §8.4 Option B — the LIMS headline: a big verdict pill + a coarse green|red zone
+            # bar, NO fine band and NO number (D-lims-number), so it reads as a stable verdict at a glance.
             badge = EvaluationResult()
-            badge.addItem(RoastGaugeView(pigmentRatio, render=GaugeRender.LABEL | GaugeRender.SWATCH))
+            badge.addItem(RoastGaugeView(pigmentRatio, render=GaugeRender.LABEL | GaugeRender.ZONES))
             step.setEvaluationResult(badge)
         step.setView(LimsPublishView(
             title="Send to LIMS",
