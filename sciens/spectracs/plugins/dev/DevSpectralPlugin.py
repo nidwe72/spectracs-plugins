@@ -39,7 +39,7 @@ class DevSpectralPlugin(SpectralPlugin):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
         phase.setHint("measurement complete")  # coach line once BOTH steps are captured (Edwin)
         phase.addToSteps(self.__measurementStep(REFERENCE, "Reference", "Insert isopropanol and capture"))
-        phase.addToSteps(self.__measurementStep(SAMPLE, "Sample", "select oil-tab and capture oil-dilution"))
+        phase.addToSteps(self.__measurementStep(SAMPLE, "Sample", "Insert the oil dilution and capture"))
 
     def processing(self, workflow):
         acquisition = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
