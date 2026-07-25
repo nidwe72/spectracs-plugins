@@ -72,18 +72,20 @@ class GaugeColorUtilTest(unittest.TestCase):
 
 class VerdictGaugeViewTest(unittest.TestCase):
     def __view(self):
-        return RoastGaugeView(3.69, GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH)
+        # 2026 recalibration (threshold 4.4): a green oil now reads ~5.0, clearing the 4.4 line.
+        return RoastGaugeView(5.0, GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH)
 
     def test_roast_preset_caches_verdict_and_swatch(self):
         view = self.__view()
         self.assertEqual(view.verdictLabel, "good — green")
         # swatch colour is the gradient at the value on the plugin's OWN anchors (read off the view)
         self.assertEqual(view.swatchColor, GaugeColorUtil().gradientColorAt(view.value, view.gradientAnchors))
-        self.assertEqual(view.bandLeft, 5.0)
-        self.assertEqual(view.bandRight, 2.0)
+        self.assertEqual(view.bandLeft, 6.0)
+        self.assertEqual(view.bandRight, 3.0)
 
     def test_brown_value_caches_brown_verdict(self):
-        self.assertEqual(RoastGaugeView(2.45, GaugeRender.LABEL).verdictLabel, "probably too brown")
+        # below the 4.4 threshold -> over-roasted brown
+        self.assertEqual(RoastGaugeView(4.0, GaugeRender.LABEL).verdictLabel, "probably too brown")
 
     def test_round_trips_through_the_view_model_factory(self):
         view = self.__view()
