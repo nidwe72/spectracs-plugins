@@ -66,7 +66,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
 
     def __metricItems(self, workflow):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION)
-        metricsStep = next(s for s in phase.getSteps().values() if s.getLabel() == "Metrics")
+        metricsStep = next(s for s in phase.getSteps().values() if s.getLabel() == "Metrics (dev)")
         return metricsStep.getEvaluationResult().getItems()
 
     def test_evaluation_colour_chips_are_the_ten_variant_set(self):
@@ -102,12 +102,12 @@ class DevPluginImprovedColourTest(unittest.TestCase):
         workflow = self.__runPlugin()
         processing = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
         step = next((s for s in processing.getSteps().values()
-                     if "despiked" in s.getLabel()), None)
+                     if s.getLabel() == "Absorption (dev)"), None)
         self.assertIsNotNone(step, "the raw/despiked/improved ladder tab")
         # raw + despiked + improved
         self.assertEqual(len(step.getView().allTraces()), 3)
 
-    # --- V3 (SPEC_capability_proof.md §2.1, Edwin 2026-07-22): the "Evaluation (new)" tab + second plot ---
+    # --- V3 (SPEC_capability_proof.md §2.1, Edwin 2026-07-22): the "Metrics" tab + second plot ---
 
     def __evalStep(self, workflow, label):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION)
@@ -115,7 +115,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
 
     def test_new_evaluation_tab_carries_pb_band_means_and_pigment_ratios(self):
         workflow = self.__runPlugin()
-        step = self.__evalStep(workflow, "Evaluation (new)")
+        step = self.__evalStep(workflow, "Metrics")
         self.assertIsNotNone(step, "the Evaluation (new) step")
         labels = [i.label for i in step.getEvaluationResult().getItems()
                   if isinstance(i, MetricFieldView) and i.color is None]
@@ -125,14 +125,14 @@ class DevPluginImprovedColourTest(unittest.TestCase):
 
     def test_new_evaluation_tab_duplicates_the_ten_colour_chips(self):
         workflow = self.__runPlugin()
-        step = self.__evalStep(workflow, "Evaluation (new)")
+        step = self.__evalStep(workflow, "Metrics")
         chips = [i for i in step.getEvaluationResult().getItems()
                  if isinstance(i, MetricFieldView) and i.color is not None]
         self.assertEqual(len(chips), 10, "the full 10-variant colour set, duplicated")
 
     def test_second_band_marked_spectrum_uses_the_pb_bands(self):
         workflow = self.__runPlugin()
-        step = self.__evalStep(workflow, "Spectrum (new)")
+        step = self.__evalStep(workflow, "Absorption (bands)")
         self.assertIsNotNone(step, "the Spectrum (new) step")
         bands = step.getView().bands  # list of (lowNm, highNm[, label])
         windows = {(round(b[0]), round(b[1])) for b in bands}
@@ -149,7 +149,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
         expected = round(util.complementViaWhitePoint(absorption, ceiling=3.0)[0])
         absHue = util.spectrumToHsl(absorption, converter="srgb", ceiling=3.0)[0]
         flip = round((absHue + 180.0) % 360.0)
-        step = self.__evalStep(workflow, "Evaluation (new)")
+        step = self.__evalStep(workflow, "Metrics")
         chip = next(i for i in step.getEvaluationResult().getItems()
                     if isinstance(i, MetricFieldView) and i.label == "Intrinsic-perceived · hue-norm")
         shown = int(chip.value.split("°")[0].replace("H", "").strip())
@@ -158,7 +158,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
 
     def test_normalized_chips_use_the_calm_c_scheme_saturation_lightness(self):
         workflow = self.__runPlugin()
-        step = self.__evalStep(workflow, "Evaluation (new)")
+        step = self.__evalStep(workflow, "Metrics")
         normChips = [i for i in step.getEvaluationResult().getItems()
                      if isinstance(i, MetricFieldView) and i.color is not None
                      and i.value is not None and "hue-norm" in i.label]

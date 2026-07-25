@@ -2,7 +2,7 @@
 SPEC_roast_ampel.md §8 — the plugin-driven Verdict gauge (Roast Ampel).
 
 Covers the Qt-free stack: GaugeColorUtil maths (G0), VerdictGaugeView round-trip + factory (G1), the
-RoastGaugeView cache (G6), and the DevSpectralPlugin wiring — gauge first in "Evaluation (new)" (G6) and the
+RoastGaugeView cache (G6), and the DevSpectralPlugin wiring — gauge first in "Metrics" (G6) and the
 verdict badge on the PUBLISHING "Send to LIMS" step (G7).
 
 Run from the spectracsPy repo root:
@@ -148,7 +148,7 @@ class DevPluginGaugeWiringTest(unittest.TestCase):
 
     def test_gauge_is_first_item_of_evaluation_new(self):
         workflow = self.__runPlugin()
-        items = self.__step(workflow, SpectralWorkflowPhaseType.EVALUATION, "Evaluation (new)") \
+        items = self.__step(workflow, SpectralWorkflowPhaseType.EVALUATION, "Metrics") \
             .getEvaluationResult().getItems()
         self.assertIsInstance(items[0], VerdictGaugeView)
         self.assertEqual(items[0].render, GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH)
@@ -164,7 +164,7 @@ class DevPluginGaugeWiringTest(unittest.TestCase):
 
     def test_badge_value_matches_the_evaluation_gauge(self):
         workflow = self.__runPlugin()
-        evalGauge = self.__step(workflow, SpectralWorkflowPhaseType.EVALUATION, "Evaluation (new)") \
+        evalGauge = self.__step(workflow, SpectralWorkflowPhaseType.EVALUATION, "Metrics") \
             .getEvaluationResult().getItems()[0]
         badge = self.__step(workflow, SpectralWorkflowPhaseType.PUBLISHING, "Send to LIMS") \
             .getEvaluationResult().getItems()[0]

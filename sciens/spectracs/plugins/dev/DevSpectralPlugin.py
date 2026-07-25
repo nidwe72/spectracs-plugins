@@ -1,7 +1,7 @@
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
     MeanOp, TransmissionOp, AbsorptionOp, BaselineOffsetOp, MedianFilterOp,
-    SpectrumPlotView, CaptureView, SpectrumCaptureView, ReportView,
+    SpectrumPlotView, CaptureView, SpectrumCaptureView, TabGroupView, ReportView,
     LimsPublishView, GaugeRender,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     EvaluationColorUtil, MetadataField,
@@ -18,11 +18,10 @@ class DevSpectralPlugin(SpectralPlugin):
     # subclassed or shared by any other plugin. Injected transiently (no session codeRef).
     title = "Measurement bench (dev)"
 
-    # SPEC_simplified_plugin_navigation.md (M3) — the "should-be" end-user-mirroring presentation, driven ENTIRELY
-    # by the plugin. TEMPORARY test toggle: flip to False to run the old step-through navigation for a regression
-    # check; removed once verified. Selects, together: auto-advance nav + per-step (Reference/Sample) chevrons +
-    # the cropped-ROI capture preview. The METADATA phase is declared unconditionally (it is a permanent addition).
-    SIMPLIFIED_NAVIGATION = True
+    # SPEC_simplified_plugin_navigation.md (M3, phase X) — the plugin drives the end-user-mirroring "should-be"
+    # presentation PERMANENTLY: auto-advance nav + per-step (Reference/Sample) chevrons + the cropped-ROI capture
+    # preview + the METADATA form. The temporary SIMPLIFIED_NAVIGATION regression toggle was removed 2026-07-25
+    # after the as-is path was rig-verified (Edwin); there is no as-is branch any more.
 
     FRAMES = 150  # burst per capture (Edwin 2026-07-15): the bench averages 150 frames for a cleaner spectrum.
     # CapturePanel seeds its frame count from this declared value; the frame-count dropdown (when shown) overrides.
@@ -42,11 +41,9 @@ class DevSpectralPlugin(SpectralPlugin):
                     "band [%g, %g] — clamping would starve it." % (lo, hi, bandLo, bandHi))
 
     def policy(self):
-        # Cross-cutting flow policy (M3). should-be = AUTO_ADVANCE + Reference/Sample chevrons; else today's STEP.
-        if self.SIMPLIFIED_NAVIGATION:
-            return WorkflowPolicy(navigation=NavigationPolicy(
-                NavigationMode.AUTO_ADVANCE, stepChevronPhases={SpectralWorkflowPhaseType.ACQUISITION}))
-        return WorkflowPolicy.default()
+        # Cross-cutting flow policy (M3): AUTO_ADVANCE + per-step Reference/Sample chevrons (the should-be preset).
+        return WorkflowPolicy(navigation=NavigationPolicy(
+            NavigationMode.AUTO_ADVANCE, stepChevronPhases={SpectralWorkflowPhaseType.ACQUISITION}))
 
     def metadata(self, workflow):
         # Change C — the METADATA form, taken over from PumpkinOilPlugin. The user lands here after measuring
@@ -80,6 +77,25 @@ class DevSpectralPlugin(SpectralPlugin):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
         phase.setHint("You can view the measurement results here.")  # SPEC_acquisition_guidance: plugin-authored
 
+        # Change G (SPEC_simplified_plugin_navigation.md §4.7-G): the Reference/Sample RASTER inspection views are
+        # now PLUGIN-DECLARED (they were host-injected bench dev-chrome). C1/T1 (§7b): the full-frame + cropped
+        # rasters are grouped into SUB-TABS via an explicit TabGroupView. The plugin declares the shells + role;
+        # the HOST fills the captured-frame pixels it alone owns (masked full-frame / cropped-to-ROI per the flag),
+        # traversing into the group. §7b renames "raster" → "image".
+        rasterSteps = {}
+        for role, label in ((REFERENCE, "Reference image"), (SAMPLE, "Sample Image")):
+            rasterStep = SpectralWorkflowStep()
+            rasterStep.setLabel(label)
+            rasterStep.setRole(role)
+            rasters = EvaluationResult()
+            rasters.addItem(TabGroupView()
+                            .addTab("Full frame", SpectrumCaptureView(
+                                caption="Region outside the ROI blacked out", cropped=False))
+                            .addTab("Cropped ROI", SpectrumCaptureView(
+                                caption="Cropped to the ROI", cropped=True)))
+            rasterStep.setEvaluationResult(rasters)
+            rasterSteps[role] = rasterStep
+
         # Spectra: reference + sample overlaid. P5: the overlay is now DECLARED as a multi-trace
         # SpectrumPlotView (was host-drawn via SpectrumPlotWidget.addTrace) — the host renders it generically.
         # M2 (Edwin): the PROCESSING Reference-vs-Sample overlay is also rendered in the PDF report.
@@ -90,13 +106,11 @@ class DevSpectralPlugin(SpectralPlugin):
                             .addTrace(meaned.getSpectra()[REFERENCE], "Reference", "c")
                             .addTrace(meaned.getSpectra()[SAMPLE], "Sample", "y")
                             .setShownInReport(True))
-        phase.addToSteps(spectraStep)
 
         transmissionStep = SpectralWorkflowStep()
         transmissionStep.setLabel("Transmission")
         transmissionStep.setContainer(transmission)
         transmissionStep.setView(SpectrumPlotView(transmission.getSpectra()[TRANSMISSION], "T(λ) = S/R"))
-        phase.addToSteps(transmissionStep)
 
         absorptionStep = SpectralWorkflowStep()
         absorptionStep.setLabel("Absorption")
@@ -105,7 +119,6 @@ class DevSpectralPlugin(SpectralPlugin):
         # example — it is shown HERE (PROCESSING) and appears in the report, but never in the EVALUATION GUI.
         absorptionStep.setView(SpectrumPlotView(absorption.getSpectra()[ABSORPTION], "A(λ) = −log10(S/R)")
                                .setShownInReport(True))
-        phase.addToSteps(absorptionStep)
 
         # SPEC_capability_proof.md §7.0.1/§8.2: the processing ladder made VISIBLE — three COLOURED traces, raw
         # (grey) -> de-spiked (orange, narrow instrument spikes removed) -> baseline-corrected (green, + flat-offset).
@@ -114,12 +127,20 @@ class DevSpectralPlugin(SpectralPlugin):
         absorptionRaw = absorption.getSpectra()[ABSORPTION]
         despiked = self.__despikedAbsorption(absorptionRaw)
         ladderStep = SpectralWorkflowStep()
-        ladderStep.setLabel("Absorption (raw / despiked / baseline-corrected)")
+        ladderStep.setLabel("Absorption (dev)")   # §7b rename (was "Absorption (raw / despiked / baseline-corrected)")
         ladderStep.setView(SpectrumPlotView(title="A(λ) — raw → despiked → baseline-corrected (flat-offset)")
                            .addTrace(absorptionRaw, "A raw", "#888888")
                            .addTrace(despiked, "A despiked", "#e08000")
                            .addTrace(self.__baselineCorrectedAbsorption(despiked), "A despiked + baseline", "g")
                            .setShownInReport(True))
+
+        # §7b step order: Spectra, Absorption, Transmission, Reference image, Sample Image, Absorption (dev).
+        # Default-selected step = Spectra (it is first ⇒ automatic).
+        phase.addToSteps(spectraStep)
+        phase.addToSteps(absorptionStep)
+        phase.addToSteps(transmissionStep)
+        phase.addToSteps(rasterSteps[REFERENCE])
+        phase.addToSteps(rasterSteps[SAMPLE])
         phase.addToSteps(ladderStep)
 
     # --- Pumpkin peak-ratio bands (HARD-CODED here for now — SPEC_pumpkin_peak_ratio_eval.md §7, Edwin #1).
@@ -169,23 +190,21 @@ class DevSpectralPlugin(SpectralPlugin):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION)
         phase.setHint("The measurement has been evaluated.")  # SPEC_acquisition_guidance: plugin-authored
         metricsStep = SpectralWorkflowStep()
-        metricsStep.setLabel("Metrics")
+        metricsStep.setLabel("Metrics (dev)")   # §7b rename (was "Metrics" — the legacy peak-ratio metrics)
         metricsResult = self.__peakRatioResult(absorption, reference, transmission)
         # M2: flag the evaluation metrics into the PDF report (the verdict numbers a reader wants on paper).
         for item in metricsResult.getItems():
             item.setShownInReport(True)
         metricsStep.setEvaluationResult(metricsResult)
-        phase.addToSteps(metricsStep)
         # Q-peak dashed marker (restored from the pre-P4 host-drawn plot): the local-max λ in the Q search band.
         peak = SpectrumFeatureUtil().peakInRange(absorption, *self.Q_SEARCH)
         qLambda = peak[0] if peak is not None else 575.0
         # M2 (Edwin): the EVALUATION band-marked absorption spectrum is also rendered in the PDF report.
         spectrumStep = SpectralWorkflowStep()
-        spectrumStep.setLabel("Spectrum")
+        spectrumStep.setLabel("Absorption (bands, dev)")   # §7b rename (was "Spectrum" — legacy band plot)
         spectrumStep.setView(SpectrumPlotView(absorption, title="A(λ) — bands")
                              .addBand(*self.BLUE_BAND).addBand(*self.GREEN_BAND).addBand(*self.Q_SEARCH)
                              .addMarker(qLambda, "Q").setShownInReport(True))
-        phase.addToSteps(spectrumStep)
 
         # V3 (SPEC_capability_proof.md §2.1): a SECOND, forward-looking evaluation view — the PB literature bands
         # (440-460 Soret / 560-580 Q) read as plain band MEANS on the DESPIKED absorbance, the pigment ratio, and
@@ -193,23 +212,21 @@ class DevSpectralPlugin(SpectralPlugin):
         # intact so the old-band numbers stay directly comparable — a tab-vs-tab "eureka" comparison (Edwin).
         despikedAbsorption = self.__despikedAbsorption(absorption)
         newStep = SpectralWorkflowStep()
-        newStep.setLabel("Evaluation (new)")
+        newStep.setLabel("Metrics")   # §7b rename (was "Evaluation (new)" — the PB literature-band metrics, now primary)
         newResult = self.__newEvaluationResult(despikedAbsorption, transmission, absorption)
         for item in newResult.getItems():
             item.setShownInReport(True)
         newStep.setEvaluationResult(newResult)
-        phase.addToSteps(newStep)
 
         # A SECOND version of the A(λ) spectrum with the NEW bands marked (Edwin): the PB Soret + Q windows plus
         # the shared 510-540 clarity floor shaded, Q local-max marked — on the same despiked curve as the metrics.
         newPeak = SpectrumFeatureUtil().peakInRange(despikedAbsorption, *self.PB_Q_BAND)
         newQLambda = newPeak[0] if newPeak is not None else 570.0
         newSpectrumStep = SpectralWorkflowStep()
-        newSpectrumStep.setLabel("Spectrum (new)")
+        newSpectrumStep.setLabel("Absorption (bands)")   # §7b rename (was "Spectrum (new)" — the PB-band A(λ) plot)
         newSpectrumStep.setView(SpectrumPlotView(despikedAbsorption, title="A(λ) — PB bands (despiked)")
                                 .addBand(*self.PB_SORET_BAND).addBand(*self.GREEN_BAND).addBand(*self.PB_Q_BAND)
                                 .addMarker(newQLambda, "Q").setShownInReport(True))
-        phase.addToSteps(newSpectrumStep)
 
         # M2 (SPEC_bench_pdf_export.md §1): declare a Report step. Its ReportView surfaces as a tab in EVALUATION
         # (beside Metrics | Spectrum) whose body the host renders with matplotlib (a preview that IS the PDF) +
@@ -221,7 +238,14 @@ class DevSpectralPlugin(SpectralPlugin):
         reportStep.setView(ReportView(title="Measurement bench report",
                                       subtitle=("Operator: %s" % username) if username else self.title,
                                       embedMetadata=True))
-        phase.addToSteps(reportStep)
+
+        # §7b step order: the NEW/PB-band views are primary; the legacy peak-ratio views become "(dev)".
+        # Metrics, Absorption (bands), Report, Metrics (dev), Absorption (bands, dev).
+        phase.addToSteps(newStep)          # "Metrics"
+        phase.addToSteps(newSpectrumStep)  # "Absorption (bands)"
+        phase.addToSteps(reportStep)       # "Report"
+        phase.addToSteps(metricsStep)      # "Metrics (dev)"
+        phase.addToSteps(spectrumStep)     # "Absorption (bands, dev)"
 
     def publishing(self, workflow):
         # L6 (SPEC_lims_integration.md §3): declare a PUBLISHING "Send to LIMS" step. Its LimsPublishView
@@ -543,13 +567,18 @@ class DevSpectralPlugin(SpectralPlugin):
         step.setView(CaptureView(prompt=prompt,
                                  captureLabel="Capture " + label.lower(), geometry="transmission",
                                  wavelengthMinNm=self.WAVELENGTH_MIN_NM, wavelengthMaxNm=self.WAVELENGTH_MAX_NM,
-                                 croppedPreview=self.SIMPLIFIED_NAVIGATION))  # Change A: cropped-ROI live preview
+                                 croppedPreview=True))  # Change A: cropped-ROI live preview (permanent, phase X)
         # M2 (SPEC_bench_pdf_export.md §5b): declare that this role's captured frame belongs in the PDF report
         # (cropped to the ROI). The plugin declares presence + flag; the HOST fills `.image` with the hardware
         # pixels after capture, embeds it as a named attachment, and draws it on the page. Alongside it, declare
         # the role's extracted SPECTRUM for the report (Edwin) — same host-fill pattern: the plugin flags an
         # empty SpectrumPlotView, the host sets its `.spectrum` from the captured spectrum after acquisition.
+        # §7b (Edwin 2026-07-25): the report wants BOTH frames — the full frame with the ROI rectangle painted
+        # (roiOverlay, "the camera saw a sane image; here's where the ROI landed") AND the cropped-to-ROI frame.
+        # Separate shownInReport items (the report has no tabs — it stacks them); NOT a TabGroupView.
         captureResult = EvaluationResult()
+        captureResult.addItem(SpectrumCaptureView(caption=label + " — full frame (ROI marked)",
+                                                  roiOverlay=True).setShownInReport(True))
         captureResult.addItem(SpectrumCaptureView(caption=label + " — captured frame (ROI)",
                                                   cropped=True).setShownInReport(True))
         captureResult.addItem(SpectrumPlotView(title=label + " — spectrum").setShownInReport(True))
