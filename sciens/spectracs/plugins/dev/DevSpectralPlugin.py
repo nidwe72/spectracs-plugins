@@ -471,8 +471,9 @@ class DevSpectralPlugin(SpectralPlugin):
 
     def __colourChips(self, transmission, absorption, despikedAbsorption=None, despikedBaselineAbsorption=None):
         # SPEC_color_retrieval.md §1 + capability_proof §7.0.1/§8.2 — the 10-variant colour set. Absorbance-derived
-        # colours use the sRGB converter (full gamut, no Philips-Hue clamp) with a ceiling so a T→0 spike can't
-        # dominate; transmission uses rgbxy (verdict-compatible). Each returns measured (h,s,l) deg/%. Three intrinsic
+        # colours use the sRGB converter (full gamut, no Philips-Hue clamp) with a RELATIVE ceiling so a T→0
+        # spike can't dominate (SPEC_capture_quality.md §17.6/7 — an absolute cap would have to be
+        # re-tuned when gamma linearization moves the absorbance scale, and this plugin ships sealed); transmission uses rgbxy (verdict-compatible). Each returns measured (h,s,l) deg/%. Three intrinsic
         # processing rungs — raw, de-spiked, de-spiked+baseline — shown hue-normalized (fixed S/L) so only HUE moves;
         # plus a natural (measured S/L) chip. Only the ABSORBED colours get the correction rungs (an additive b is a
         # chromaticity SHIFT for absorbed, invariant for perceived). Order: intrinsic → intrinsic-perceived (+180°
@@ -482,9 +483,9 @@ class DevSpectralPlugin(SpectralPlugin):
         def hsl(spectrum, converter, ceiling=None):
             return util.spectrumToHsl(spectrum, converter=converter, ceiling=ceiling) if spectrum is not None else None
 
-        hslAbsorb = hsl(absorption, "srgb", 3.0)
-        hslDespiked = hsl(despikedAbsorption, "srgb", 3.0)
-        hslBaseline = hsl(despikedBaselineAbsorption, "srgb", 3.0)
+        hslAbsorb = hsl(absorption, "srgb", util.RELATIVE)
+        hslDespiked = hsl(despikedAbsorption, "srgb", util.RELATIVE)
+        hslBaseline = hsl(despikedBaselineAbsorption, "srgb", util.RELATIVE)
         hslPerceive = hsl(transmission, "rgbxy")
 
         # Intrinsic-perceived = the COLORIMETRIC complement of the absorbed colour (SPEC_capability_proof.md option
@@ -492,7 +493,7 @@ class DevSpectralPlugin(SpectralPlugin):
         # (which lands ~34° off the true perceived hue; the white-point complement is ~4° on K/L/M/N). One per
         # absorbance rung, so the processed twins stay meaningful.
         def complement(spectrum):
-            return util.complementViaWhitePoint(spectrum, ceiling=3.0) if spectrum is not None else None
+            return util.complementViaWhitePoint(spectrum, ceiling=util.RELATIVE) if spectrum is not None else None
         hslIntrinsicPerceived = complement(absorption)
         hslIPDespiked = complement(despikedAbsorption)
         hslIPBaseline = complement(despikedBaselineAbsorption)
