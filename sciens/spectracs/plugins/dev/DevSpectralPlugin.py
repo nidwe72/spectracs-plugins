@@ -9,6 +9,7 @@ from sciens.spectracs.plugin_sdk import (
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
 from sciens.spectracs.plugins.dev.RoastGaugeView import RoastGaugeView
+from sciens.spectracs.plugins.dev.RoastBaselineGaugeView import RoastBaselineGaugeView
 
 
 class DevSpectralPlugin(SpectralPlugin):
@@ -30,7 +31,7 @@ class DevSpectralPlugin(SpectralPlugin):
         # Every wavelength band this plugin's evaluation reads — the capture window (§9 M1) must cover them all,
         # else clamping would starve an eval band. The host / assertion reads this generically.
         return [self.BLUE_BAND, self.BLUE_PEAK, self.GREEN_BAND, self.Q_SEARCH, self.Q_BASELINE,
-                self.PB_SORET_BAND, self.PB_Q_BAND]
+                self.PB_SORET_BAND, self.PB_Q_BAND] + list(self.PB_BASELINE_WINDOWS)
 
     def __assertWindowCoversBands(self):
         lo, hi = self.WAVELENGTH_MIN_NM, self.WAVELENGTH_MAX_NM
@@ -166,6 +167,13 @@ class DevSpectralPlugin(SpectralPlugin):
     # inside the 440-630 capture clamp, so no window change (they are added to declaredEvalBands below).
     PB_SORET_BAND = (440.0, 460.0)    # Soret right-hand slope = green-pigment blue absorption
     PB_Q_BAND = (560.0, 580.0)        # green-pigment Q-band
+
+    # --- SPEC_capture_quality.md §16.10.2/§16.10.9: the two OIL-QUIET windows the linear baseline is fitted
+    # through. A re-seating tilt enters absorbance as an offset AND a slope; fitting a straight line across
+    # these two windows and subtracting it removes both, where a flat-offset subtraction removes only the
+    # offset and SNV only offset+scale. They must bracket the Soret and Q bands and sit where the oil itself
+    # is featureless, and both lie inside the 440–630 capture clamp.
+    PB_BASELINE_WINDOWS = ((520.0, 540.0), (600.0, 630.0))
 
     # Hue-normalized colour chips: a fixed, CALM S/L so only HUE varies between oils (SPEC_capability_proof.md §5,
     # "C scheme" — Edwin 2026-07-22). Lowered from the original vivid 80/50 to a darker, less "popping" pair.
@@ -413,6 +421,16 @@ class DevSpectralPlugin(SpectralPlugin):
                 return None
             return numerator / max(denominator, self.__EPS)
 
+        # SPEC_capture_quality.md §16.10.9 — the LINEAR-BASELINE pigment ratio, ADDITIONAL to the raw Soret/Q
+        # above (both are emitted; neither replaces the other). Fit a line through the two oil-quiet windows,
+        # subtract it, then take the same Soret ÷ Q on the corrected curve. Removes the offset AND the slope a
+        # re-seating tilt injects — where the raw ratio removes neither. Same de-spiked input as the raw ratio,
+        # so the two rows differ ONLY by the baseline correction and stay directly comparable.
+        baselined = util.linearBaselineCorrected(despikedAbsorption, self.PB_BASELINE_WINDOWS)
+        baselineSoret = util.bandMean(baselined, *self.PB_SORET_BAND) if baselined is not None else None
+        baselineQ = util.bandMean(baselined, *self.PB_Q_BAND) if baselined is not None else None
+        baselineRatio = ratio(baselineSoret, baselineQ)
+
         dilutionInvariant = MetricFieldViewStyle.builder().labelBold(True).build()
         result = EvaluationResult()
         # SPEC_roast_ampel.md §8.5 — the Roast Ampel gauge is the FIRST item of this tab (gradient band + marker +
@@ -421,6 +439,12 @@ class DevSpectralPlugin(SpectralPlugin):
         if pigmentRatio is not None:
             result.addItem(RoastGaugeView(pigmentRatio,
                                           render=GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH))
+        # §16.10.9 — the SECOND gauge, on its own scale (15.0 -> 7.0, threshold 10.3), directly under the first
+        # so the two verdicts can be read against each other at a glance. The NUMBERS are not comparable between
+        # the two gauges — only the verdicts are.
+        if baselineRatio is not None:
+            result.addItem(RoastBaselineGaugeView(baselineRatio,
+                                                  render=GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH))
         # Full 10-variant colour set, DUPLICATED from the legacy tab (identical builder → identical chips), at the
         # calm C-scheme S/L. Placed first so the eye lands on colour, then the numbers. (Header labels removed
         # 2026-07-24, Edwin — the gauge row + the metric rows are self-explanatory.)
@@ -442,6 +466,19 @@ class DevSpectralPlugin(SpectralPlugin):
         result.addItem(MetricFieldView("Pigment ratio · clarity", fmt(ratio(soret, clarity)),
             "Soret ÷ clarity-floor on the NEW bands (440–460 / 510–540) — the stable-denominator safety net for "
             "the pigment ratio; dilution-invariant.", style=dilutionInvariant))
+        # §16.10.9 — the linear-baseline rows. The two band means are emitted beside the ratio so a reader can
+        # see WHAT the correction did to each band, not just its effect on the quotient.
+        result.addItem(MetricFieldView("Soret · linear baseline", fmt(baselineSoret),
+            "mean 440–460 absorbance measured above the fitted 520–540/600–630 baseline, not above zero."))
+        result.addItem(MetricFieldView("Q · linear baseline", fmt(baselineQ),
+            "mean 560–580 absorbance measured above the same fitted baseline."))
+        result.addItem(MetricFieldView("Pigment ratio · linear baseline", fmt(baselineRatio),
+            "Soret ÷ Q after subtracting a straight line fitted through the oil-quiet 520–540 and 600–630 "
+            "windows. A re-seating tilt enters absorbance as an offset AND a slope; this removes both, where "
+            "the plain ratio removes neither. On 2026-07-27 (15 runs) it sorted all 9 green runs above all 6 "
+            "brown, which the plain ratio does not — but its scale differs, so do NOT compare it numerically "
+            "to the rows above. ⚠ fixed dilution only; dilution invariance unresolved (§16.10.8).",
+            style=dilutionInvariant))
         return result
 
     def __pairMetric(self, result, label, rawText, despikedText, tooltip, style=None):
