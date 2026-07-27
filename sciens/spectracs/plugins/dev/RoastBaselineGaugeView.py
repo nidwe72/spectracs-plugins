@@ -21,20 +21,35 @@ class RoastBaselineGaugeView(VerdictGaugeView):
     # INTERLEAVES the two classes and no threshold separates them (3 of 15 wrong at best). Cohen's d 1.18 -> 2.48.
     #
     # ⚠ THE THRESHOLD IS PROVISIONAL AND MUST NOT BE READ AS CALIBRATED (§16.10.7 / §16.10.9):
-    #   - n = 15, ONE day, ONE pair of oils, ±2.7 % margin at the nearest run
+    #   - n = 25, ONE day, ONE pair of oils
     #   - separation is demonstrated at FIXED DILUTION only; dilution invariance is UNRESOLVED (§16.10.8),
     #     because seating noise alone produces a 1.34x metric spread — as large as a 2.19x dilution change
     #   - the band edges and the two quiet windows were chosen AFTER seeing the tilt problem, so they are
     #     fitted, not independent
     # Fresh-data validation (both classes, n >= 15, one optical configuration) still gates any promotion of
     # this gauge from "second opinion" to headline.
-    __THRESHOLD = 10.3      # midpoint of worst-green 10.565 / best-brown 10.002, rounded
+    #
+    # ─ 10.3 -> 10.6: a POLICY choice, not a fit (Edwin 2026-07-27, §16.10.17d) ──────────────────────────────
+    # 10.3 was the midpoint of the observed EXTREMES (worst green 10.506 / best brown 10.011) — arithmetic that
+    # silently protected the green verdict and paid for it in brown detection power. Edwin's decision:
+    # **passing bad oil is the costlier error**, so the line moves to ~midway between the class MEANS (green
+    # 12.18, brown 9.06), which gives the two classes comparable headroom.
+    #
+    #   measured on the 25 runs of 2026-07-27:      T = 10.3        T = 10.6
+    #     brown triplets resolved at 95 %            1/21 =  5 %    11/21 = 52 %   <- the point of the change
+    #     green triplets resolved at 95 %          114/119 = 96 %   95/119 = 80 %
+    #     in-sample misclassifications                  0/25            1/25
+    #
+    # The accepted cost is green E006 (10.506), which now reads brown. Note B008 (10.604) clears the line by
+    # 0.004 — functionally a coin flip, so budget for 1–2 accepted false-browns, not exactly 1. That direction
+    # is deliberate: a false BROWN costs a re-check, a false GREEN ships bad oil.
+    __THRESHOLD = 10.6
 
     _GOOD = {"text": "#FFFFFF", "bg": "#2f3b1f"}      # white on dark-green chip — matches RoastGaugeView
     _BROWN = {"text": "#FFFFFF", "bg": "#3b241f"}     # white on dark-brown chip
     # Same ramp shape as RoastGaugeView, stretched onto this scale: fresh green at the top, a muted-olive pivot
     # AT the threshold, then brown kicking in aggressively just below it and deepening to the right edge.
-    _ANCHORS = [(15.0, "#9B9E57"), (10.3, "#8B8952"), (9.5, "#6E4A22"), (7.0, "#442C0E")]
+    _ANCHORS = [(15.0, "#9B9E57"), (10.6, "#8B8952"), (9.8, "#6E4A22"), (7.0, "#442C0E")]
     _THRESHOLDS = [__THRESHOLD]
     _BAND_LEFT = 15.0       # headroom past the highest green observed (14.209)
     _BAND_RIGHT = 7.0       # headroom past the lowest brown observed (7.714)
