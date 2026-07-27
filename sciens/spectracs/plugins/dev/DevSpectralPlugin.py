@@ -102,7 +102,10 @@ class DevSpectralPlugin(SpectralPlugin):
         spectraStep = SpectralWorkflowStep()
         spectraStep.setLabel("Spectra")
         spectraStep.setContainer(meaned)
-        spectraStep.setView(SpectrumPlotView(title="Reference vs Sample")
+        # axis="dn": these are RAW capture spectra. On a linear axis the dim-but-healthy range collapses into
+        # the bottom 4% and a fine 60 DN band reads as "nothing" — which caused a mis-dilution on 2026-07-27
+        # (SPEC_capture_quality.md §16.7.2e). Transmission/absorbance below stay unitless: no axis flag.
+        spectraStep.setView(SpectrumPlotView(title="Reference vs Sample", axis="dn")
                             .addTrace(meaned.getSpectra()[REFERENCE], "Reference", "c")
                             .addTrace(meaned.getSpectra()[SAMPLE], "Sample", "y")
                             .setShownInReport(True))
