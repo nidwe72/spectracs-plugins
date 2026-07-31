@@ -168,11 +168,28 @@ class DevSpectralPlugin(SpectralPlugin):
     PB_SORET_BAND = (440.0, 460.0)    # Soret right-hand slope = green-pigment blue absorption
     PB_Q_BAND = (560.0, 580.0)        # green-pigment Q-band
 
-    # --- SPEC_capture_quality.md §16.10.2/§16.10.9: the two OIL-QUIET windows the linear baseline is fitted
+    # --- SPEC_capture_quality.md §16.10.2/§16.10.9: the two anchor windows the linear baseline is fitted
     # through. A re-seating tilt enters absorbance as an offset AND a slope; fitting a straight line across
     # these two windows and subtracting it removes both, where a flat-offset subtraction removes only the
-    # offset and SNV only offset+scale. They must bracket the Soret and Q bands and sit where the oil itself
-    # is featureless, and both lie inside the 440–630 capture clamp.
+    # offset and SNV only offset+scale. Both lie inside the 440–630 capture clamp.
+    #
+    # ⚠ THE FAR WINDOW IS NOT "OIL-QUIET" — it MEASURES. (Was documented as featureless until 2026-07-31;
+    # SPEC_capability_proof.md §2.1a, SPEC_capture_quality.md §16.12.12/§16.12.13.) Expanding the correction
+    # at the two band centroids, the shipped metric is really THREE-REGION:
+    #
+    #            A_Soret − 1.941·A_near + 0.941·A_far
+    #   S/Q  =  ──────────────────────────────────────      (reproduces this code to within 0.5 %)
+    #            A_Q     − 0.529·A_near − 0.471·A_far
+    #
+    # A_far enters the NUMERATOR positively and the DENOMINATOR negatively — both RAISE the ratio. And
+    # 600–630 carries real green pigment: the rise across it is green 0.0535 vs brown 0.0159 (5.1 σ, 37 runs)
+    # under an identical lamp, i.e. the flank toward the true chlorophyll Q max near 665 nm, which sits
+    # outside our capture clamp. So it is a third pigment band, not a correction anchor.
+    #
+    # It is also LOAD-BEARING: sweeping the far edge in, Cohen's d falls 2.88 → 0.94 and the classes overlap
+    # outright at 600–610. Do NOT "clean up" these windows on the assumption that they are signal-free — the
+    # discrimination goes with them. Changing them is a metric redesign, not a tidy-up, and it is gated on
+    # post-rig-rebuild data with a real brown series (§16.12.15 item 2).
     PB_BASELINE_WINDOWS = ((520.0, 540.0), (600.0, 630.0))
 
     # Hue-normalized colour chips: a fixed, CALM S/L so only HUE varies between oils (SPEC_capability_proof.md §5,
