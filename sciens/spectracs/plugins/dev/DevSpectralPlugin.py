@@ -10,6 +10,8 @@ from sciens.spectracs.plugin_sdk import (
 )
 from sciens.spectracs.plugins.dev.RoastGaugeView import RoastGaugeView
 from sciens.spectracs.plugins.dev.RoastBaselineGaugeView import RoastBaselineGaugeView
+from sciens.spectracs.plugins.dev.RoastPedestalGaugeView import RoastPedestalGaugeView
+from sciens.spectracs.plugins.dev.RoastFar620GaugeView import RoastFar620GaugeView
 
 
 class DevSpectralPlugin(SpectralPlugin):
@@ -30,8 +32,13 @@ class DevSpectralPlugin(SpectralPlugin):
     def declaredEvalBands(self):
         # Every wavelength band this plugin's evaluation reads — the capture window (§9 M1) must cover them all,
         # else clamping would starve an eval band. The host / assertion reads this generically.
-        return [self.BLUE_BAND, self.BLUE_PEAK, self.GREEN_BAND, self.Q_SEARCH, self.Q_BASELINE,
-                self.PB_SORET_BAND, self.PB_Q_BAND] + list(self.PB_BASELINE_WINDOWS)
+        # ⚠ The LEGACY 600-630 anchor is deliberately NOT declared: nothing in this plugin computes on it
+        # any more (§16.20), and this method's contract is the bands the evaluation actually READS.
+        # ⚠ PB_BASELINE_WINDOWS' upper edge is 630 nm, exactly WAVELENGTH_MAX_NM — the anchor sits hard
+        # against the capture edge, so any future narrowing of the ROI starves it.
+        return ([self.BLUE_BAND, self.BLUE_PEAK, self.GREEN_BAND, self.Q_SEARCH, self.Q_BASELINE,
+                 self.PB_SORET_BAND, self.PB_Q_BAND]
+                + list(self.PB_BASELINE_WINDOWS))
 
     def __assertWindowCoversBands(self):
         lo, hi = self.WAVELENGTH_MIN_NM, self.WAVELENGTH_MAX_NM
@@ -190,7 +197,36 @@ class DevSpectralPlugin(SpectralPlugin):
     # outright at 600–610. Do NOT "clean up" these windows on the assumption that they are signal-free — the
     # discrimination goes with them. Changing them is a metric redesign, not a tidy-up, and it is gated on
     # post-rig-rebuild data with a real brown series (§16.12.15 item 2).
-    PB_BASELINE_WINDOWS = ((520.0, 540.0), (600.0, 630.0))
+    PB_BASELINE_WINDOWS_LEGACY_600 = ((520.0, 540.0), (600.0, 630.0))
+
+    # --- SPEC_capture_quality.md §16.20 — the 620-630 FAR ANCHOR (Edwin 2026-08-02/03) -------------------
+    # Same near anchor, far anchor moved from 600-630 to 620-630. Two things follow from the paragraph above:
+    # the far window MEASURES rather than corrects, and protochlorophyll's Qy sits at ~623-626 nm
+    # (`KB_spectroscopy_physics.md` §4.1). 620-630 is therefore CENTRED on the pigment band instead of
+    # straddling it, and it starts clear of the 607 nm lamp emission line, whose excess collapses between
+    # 609 and 610 nm (§16.20.6).
+    #
+    # ⚠ `PB_BASELINE_WINDOWS_LEGACY_600` ABOVE MUST KEEP MEANING 600-630 FOREVER. Ten diagnostics read it,
+    # and one is load-bearing for the entire §16 evidence base: `settling_sweep.py` derives the reference
+    # metric that every comparison table is built on, under the keys `A_Soret linear` / `A_Q linear` /
+    # `S/Q linear base`. Repointing it would silently redefine every historical number in the specs.
+    #
+    # ⚠ 630 nm is exactly WAVELENGTH_MAX_NM and the grid actually stops at 629.8, so this anchor is really
+    # 620-629.8 and sits hard against the capture edge. `declaredEvalBands()` covers it, but any future
+    # narrowing of the ROI starves it silently.
+    PB_BASELINE_WINDOWS = ((520.0, 540.0), (620.0, 630.0))
+
+    # The pedestal residual REFITTED ON THE 620-630 ANCHOR (§16.20.2; Kiendler run-level straight-line fit,
+    # `diagnostics/pedestal_correction.py`). NOT the 600-630 anchor's -0.0246: move the anchor and the
+    # residual moves with it, so pairing these bands with that constant would be a category error.
+    #
+    # ⚠⚠ THIS IS AN INSTRUMENT CONSTANT LIVING IN A DISTRIBUTED PLUGIN, AND THAT IS THE WRONG HOME FOR IT.
+    # It was fitted on ONE oil on THIS rig, and §16.19 shows it does not survive a mechanical rebuild. Every
+    # instrument loading this plugin therefore inherits one instrument's number. Acceptable for the DEV bench
+    # tool it is used in; NOT acceptable for anything an end user runs. §16.17 designs the calibration that
+    # should own it (per-instrument, stored on the instrument record, re-measured after any rig change), and
+    # §16.17.8 blocker 6 records what must be settled first.
+    PB_R_Q = -0.0184
 
     # Hue-normalized colour chips: a fixed, CALM S/L so only HUE varies between oils (SPEC_capability_proof.md §5,
     # "C scheme" — Edwin 2026-07-22). Lowered from the original vivid 80/50 to a darker, less "popping" pair.
@@ -287,12 +323,17 @@ class DevSpectralPlugin(SpectralPlugin):
         step.setLabel("Send to LIMS")
         # SPEC_roast_ampel.md §8.6 — the end-user headline: show the verdict badge on the publish step, above the
         # publish button. The badge is one more view-model in the step's item list (LABEL + SWATCH render).
-        pigmentRatio = self.__pigmentRatio(workflow)
-        if pigmentRatio is not None:
+        pedestalRatio = self.__pedestalRatio(workflow)
+        if pedestalRatio is not None:
             # SPEC_roast_ampel.md §8.4 Option B — the LIMS headline: a big verdict pill + a coarse green|red zone
             # bar, NO fine band and NO number (D-lims-number), so it reads as a stable verdict at a glance.
+            # ⚠ SWITCHED 2026-08-03 (§16.20). This badge used to be driven by RoastGaugeView on the RAW Soret/Q
+            # ratio — the one metric of the three that cannot separate the classes at all (d = 1.20, classes
+            # overlap), on the threshold T = 4.4 that sits below the entire brown class. It was therefore
+            # reporting "good — green" for brown oil on the ONE screen an end user actually sees. It now uses
+            # the same primary metric as the first EVALUATION gauge.
             badge = EvaluationResult()
-            badge.addItem(RoastGaugeView(pigmentRatio, render=GaugeRender.LABEL | GaugeRender.ZONES))
+            badge.addItem(RoastPedestalGaugeView(pedestalRatio, render=GaugeRender.LABEL | GaugeRender.ZONES))
             step.setEvaluationResult(badge)
         step.setView(LimsPublishView(
             title="Send to LIMS",
@@ -302,20 +343,24 @@ class DevSpectralPlugin(SpectralPlugin):
             backend="senaite", configKey="SENAITE"))
         phase.addToSteps(step)
 
-    def __pigmentRatio(self, workflow):
-        # SPEC_roast_ampel.md §8.6 — the Soret/Q pigment ratio on the despiked absorbance, the same value the
-        # Evaluation (new) gauge shows. Recomputed here (publishing() gets the workflow) so the phase hooks stay
-        # independent — cheap, deterministic, no cross-phase stashing.
+    def __pedestalRatio(self, workflow):
+        # SPEC_roast_ampel.md §8.6 / SPEC_capture_quality.md §16.20 — the PRIMARY pigment index: the 620-630
+        # baseline with that anchor's pedestal residual put back, i.e. the same value the first EVALUATION
+        # gauge shows. Recomputed here (publishing() gets the workflow) so the phase hooks stay independent —
+        # cheap, deterministic, no cross-phase stashing.
         absorption = self.__findRole(workflow, ABSORPTION)
         if absorption is None:
             return None
         despiked = self.__despikedAbsorption(absorption)
         util = SpectrumFeatureUtil()
-        soret = util.bandMean(despiked, *self.PB_SORET_BAND)
-        qBand = util.bandMean(despiked, *self.PB_Q_BAND)
+        far620 = util.linearBaselineCorrected(despiked, self.PB_BASELINE_WINDOWS)
+        if far620 is None:
+            return None
+        soret = util.bandMean(far620, *self.PB_SORET_BAND)
+        qBand = util.bandMean(far620, *self.PB_Q_BAND)
         if soret is None or qBand is None:
             return None
-        return soret / max(qBand, self.__EPS)
+        return soret / max(qBand - self.PB_R_Q, self.__EPS)
 
     def __computeMetrics(self, absorption, reference):
         # Pure peak-ratio computation on ONE absorbance spectrum. Called twice by __peakRatioResult — once on the
@@ -438,30 +483,34 @@ class DevSpectralPlugin(SpectralPlugin):
                 return None
             return numerator / max(denominator, self.__EPS)
 
-        # SPEC_capture_quality.md §16.10.9 — the LINEAR-BASELINE pigment ratio, ADDITIONAL to the raw Soret/Q
-        # above (both are emitted; neither replaces the other). Fit a line through the two oil-quiet windows,
-        # subtract it, then take the same Soret ÷ Q on the corrected curve. Removes the offset AND the slope a
-        # re-seating tilt injects — where the raw ratio removes neither. Same de-spiked input as the raw ratio,
-        # so the two rows differ ONLY by the baseline correction and stay directly comparable.
-        baselined = util.linearBaselineCorrected(despikedAbsorption, self.PB_BASELINE_WINDOWS)
-        baselineSoret = util.bandMean(baselined, *self.PB_SORET_BAND) if baselined is not None else None
-        baselineQ = util.bandMean(baselined, *self.PB_Q_BAND) if baselined is not None else None
-        baselineRatio = ratio(baselineSoret, baselineQ)
+        # SPEC_capture_quality.md §16.20 — the SAME construction on the 620-630 far anchor, which is centred on
+        # protochlorophyll's Qy band instead of straddling it and starts clear of the 607 nm lamp line. Two
+        # ratios come off it: the plain one, and the one with that anchor's own pedestal residual put back.
+        # ⚠ The three verdicts live on THREE DIFFERENT SCALES. Only their verdicts are comparable.
+        far620 = util.linearBaselineCorrected(despikedAbsorption, self.PB_BASELINE_WINDOWS)
+        far620Soret = util.bandMean(far620, *self.PB_SORET_BAND) if far620 is not None else None
+        far620Q = util.bandMean(far620, *self.PB_Q_BAND) if far620 is not None else None
+        far620Ratio = ratio(far620Soret, far620Q)
+        pedestalRatio = (None if far620Soret is None or far620Q is None
+                         else far620Soret / max(far620Q - self.PB_R_Q, self.__EPS))
 
         dilutionInvariant = MetricFieldViewStyle.builder().labelBold(True).build()
         result = EvaluationResult()
         # SPEC_roast_ampel.md §8.5 — the Roast Ampel gauge is the FIRST item of this tab (gradient band + marker +
         # verdict pill + value-on-swatch), driven by the same Soret/Q pigment ratio the metric row below shows.
         pigmentRatio = ratio(soret, qBand)
-        if pigmentRatio is not None:
-            result.addItem(RoastGaugeView(pigmentRatio,
-                                          render=GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH))
-        # §16.10.9 — the SECOND gauge, on its own scale (15.0 -> 7.0, threshold 10.3), directly under the first
-        # so the two verdicts can be read against each other at a glance. The NUMBERS are not comparable between
-        # the two gauges — only the verdicts are.
-        if baselineRatio is not None:
-            result.addItem(RoastBaselineGaugeView(baselineRatio,
-                                                  render=GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH))
+        # §16.20 — THREE verdicts, in decreasing order of how much correction has been applied, so the reader
+        # can see what each step of the construction buys:
+        #   1  620-630 anchor + pedestal correction   <- the primary
+        #   2  620-630 anchor, no correction
+        #   3  raw Soret/Q                            <- VALUE ONLY, deliberately NO gauge (see below)
+        # Each pair of adjacent rows isolates exactly one change. The NUMBERS are not comparable between them.
+        if pedestalRatio is not None:
+            result.addItem(RoastPedestalGaugeView(
+                pedestalRatio, render=GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH))
+        if far620Ratio is not None:
+            result.addItem(RoastFar620GaugeView(
+                far620Ratio, render=GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH))
         # Full 10-variant colour set, DUPLICATED from the legacy tab (identical builder → identical chips), at the
         # calm C-scheme S/L. Placed first so the eye lands on colour, then the numbers. (Header labels removed
         # 2026-07-24, Edwin — the gauge row + the metric rows are self-explanatory.)
@@ -485,16 +534,21 @@ class DevSpectralPlugin(SpectralPlugin):
             "the pigment ratio; dilution-invariant.", style=dilutionInvariant))
         # §16.10.9 — the linear-baseline rows. The two band means are emitted beside the ratio so a reader can
         # see WHAT the correction did to each band, not just its effect on the quotient.
-        result.addItem(MetricFieldView("Soret · linear baseline", fmt(baselineSoret),
-            "mean 440–460 absorbance measured above the fitted 520–540/600–630 baseline, not above zero."))
-        result.addItem(MetricFieldView("Q · linear baseline", fmt(baselineQ),
+        result.addItem(MetricFieldView("Soret · baseline", fmt(far620Soret),
+            "mean 440–460 absorbance measured above the fitted 520–540/620–630 baseline, not above zero."))
+        result.addItem(MetricFieldView("Q · baseline", fmt(far620Q),
             "mean 560–580 absorbance measured above the same fitted baseline."))
-        result.addItem(MetricFieldView("Pigment ratio · linear baseline", fmt(baselineRatio),
-            "Soret ÷ Q after subtracting a straight line fitted through the oil-quiet 520–540 and 600–630 "
-            "windows. A re-seating tilt enters absorbance as an offset AND a slope; this removes both, where "
-            "the plain ratio removes neither. On 2026-07-27 (15 runs) it sorted all 9 green runs above all 6 "
-            "brown, which the plain ratio does not — but its scale differs, so do NOT compare it numerically "
-            "to the rows above. ⚠ fixed dilution only; dilution invariance unresolved (§16.10.8).",
+        # §16.20 — THE THIRD VERDICT, deliberately a VALUE WITH NO GAUGE. On post-rebuild data the raw ratio
+        # does NOT separate the classes: green 5.387 ± 0.510 against brown 4.842 ± 0.290, Cohen's d 1.20, and
+        # the classes OVERLAP outright (lowest green run 4.863 < highest brown run 5.340). No threshold
+        # classifies all 28 archived runs, so any pill drawn here would be a guess wearing a verdict's clothes.
+        # ⚠ This also retired the shipped T = 4.4, which sat BELOW the entire brown class (minimum 4.622) and
+        # therefore called every run of the brown S-Budget oil "good — green".
+        result.addItem(MetricFieldView("Verdict · raw Soret/Q  (no verdict)", fmt(pigmentRatio),
+            "Soret ÷ Q with NO baseline at all — shown for continuity with the older reports and as the "
+            "uncorrected end of the three-verdict ladder. ⚠ NO verdict is drawn because this quantity cannot "
+            "carry one: on post-rebuild data the green and brown classes OVERLAP (Cohen's d 1.20 against 9.46 "
+            "and 10.35 for the two gauges above), so no threshold separates them. Read the gauges, not this.",
             style=dilutionInvariant))
         return result
 
