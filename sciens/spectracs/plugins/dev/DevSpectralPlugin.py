@@ -190,8 +190,16 @@ class DevSpectralPlugin(SpectralPlugin):
     #
     # A_far enters the NUMERATOR positively and the DENOMINATOR negatively — both RAISE the ratio. And
     # 600–630 carries real green pigment: the rise across it is green 0.0535 vs brown 0.0159 (5.1 σ, 37 runs)
-    # under an identical lamp, i.e. the flank toward the true chlorophyll Q max near 665 nm, which sits
-    # outside our capture clamp. So it is a third pigment band, not a correction anchor.
+    # under an identical lamp. So it is a third pigment band, not a correction anchor.
+    #
+    # ⚠ CORRECTED 2026-08-04. This comment said "the flank toward the true CHLOROPHYLL Q max near 665 nm,
+    # which sits OUTSIDE our capture clamp". Both halves were wrong, and they contradicted the block
+    # directly below. The pigment is PROTOchlorophyll — a porphyrin, not a chlorin — and its Qy sits at
+    # ~623-626 nm (`KB_spectroscopy_physics.md` §4.1, sourced from Fruhwirth & Hermetter 2007). The band
+    # is therefore INSIDE the window, not a distant flank of something unreachable. The 5.1 σ measurement
+    # and every consequence below stand; the attribution gets stronger, because the rise is the band
+    # itself rather than its tail. `LAB_DIARY_capability_proof.md` §2 recorded this correction on
+    # 2026-07-31 and stated the comment had been fixed — it had not.
     #
     # It is also LOAD-BEARING: sweeping the far edge in, Cohen's d falls 2.88 → 0.94 and the classes overlap
     # outright at 600–610. Do NOT "clean up" these windows on the assumption that they are signal-free — the
