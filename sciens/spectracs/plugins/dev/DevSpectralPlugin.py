@@ -34,8 +34,9 @@ class DevSpectralPlugin(SpectralPlugin):
         # else clamping would starve an eval band. The host / assertion reads this generically.
         # ⚠ The LEGACY 600-630 anchor is deliberately NOT declared: nothing in this plugin computes on it
         # any more (§16.20), and this method's contract is the bands the evaluation actually READS.
-        # ⚠ PB_BASELINE_WINDOWS' upper edge is 630 nm, exactly WAVELENGTH_MAX_NM — the anchor sits hard
-        # against the capture edge, so any future narrowing of the ROI starves it.
+        # ⚠ PB_BASELINE_WINDOWS' upper edge is 630 nm. It USED to sit hard against WAVELENGTH_MAX_NM; since the
+        # window was widened to 700 nm (2026-08-09) it no longer does, but 630 is still the reddest declared
+        # band, so any future narrowing of the ROI below 630 starves it.
         return ([self.BLUE_BAND, self.BLUE_PEAK, self.GREEN_BAND, self.Q_SEARCH, self.Q_BASELINE,
                  self.PB_SORET_BAND, self.PB_Q_BAND]
                 + list(self.PB_BASELINE_WINDOWS))
@@ -219,9 +220,11 @@ class DevSpectralPlugin(SpectralPlugin):
     # metric that every comparison table is built on, under the keys `A_Soret linear` / `A_Q linear` /
     # `S/Q linear base`. Repointing it would silently redefine every historical number in the specs.
     #
-    # ⚠ 630 nm is exactly WAVELENGTH_MAX_NM and the grid actually stops at 629.8, so this anchor is really
-    # 620-629.8 and sits hard against the capture edge. `declaredEvalBands()` covers it, but any future
-    # narrowing of the ROI starves it silently.
+    # ⚠ HISTORICAL: 630 nm WAS exactly WAVELENGTH_MAX_NM and the grid stopped at 629.8, so on every run captured
+    # before 2026-08-09 this anchor was really 620-629.8, sitting hard against the capture edge. The window now
+    # reaches 636 nm, so the anchor is fully interior and reads the full 620-630 for the first time — expect a
+    # small step in the far-anchor level against the pre-widening archive. `declaredEvalBands()` covers it; any
+    # future narrowing of the ROI below 630 starves it silently.
     PB_BASELINE_WINDOWS = ((520.0, 540.0), (620.0, 630.0))
 
     # The pedestal residual REFITTED ON THE 620-630 ANCHOR (§16.20.2; Kiendler run-level straight-line fit,
@@ -241,12 +244,44 @@ class DevSpectralPlugin(SpectralPlugin):
     __NORM_SATURATION = 38.0
     __NORM_LIGHTNESS = 34.0
 
-    # SPEC_capture_quality.md §9 (M1) / SPEC_capability_proof.md §7.0.2: the CFL lamp illuminates usefully only
-    # ~440–630 nm. The host HARD-CLAMPS the captured ROI to this window (via CaptureView.wavelengthMin/MaxNm) so
-    # the dead margins never enter the stored spectrum (they'd only feed the S/R floor-guard garbage). Must ⊇
-    # every declaredEvalBand() below — asserted in acquisition() — including the incoming PB blue band at 440.
+    # SPEC_capture_quality.md §9 (M1) / SPEC_capability_proof.md §7.0.2: the host HARD-CLAMPS the captured ROI to
+    # this window (via CaptureView.wavelengthMin/MaxNm) so the dead margins never enter the stored spectrum
+    # (they'd only feed the S/R floor-guard garbage). Must ⊇ every declaredEvalBand() below — asserted in
+    # acquisition() — including the PB blue band at 440.
+    #
+    # 440–630 → 700 → 636 nm (Edwin 2026-08-09, settled in three steps on one evening). The 630 edge was the
+    # old lamp's useful limit, and the 620–630 far anchor was the reddest thing it could light. 700 was tried
+    # first, to reach a 660 nm LED; runs 20260808A/B measured that the camera's IR-cut kills everything past
+    # ~650 (130× down at 660, at the dark floor by 665), so 650–700 can only ever be floor noise on this
+    # camera. ⭐ 636 is EDWIN'S CALL, and the reason is PRESENTATION, not physics: past ~636 the A(λ) curve
+    # wobbles as the lamp dies, and the ~630 peak stops reading as a peak on the plot.
+    #
+    # ⚠ WHAT THIS COSTS — read before deriving anything from the red flank:
+    #  * the protochlorophyll Qy band measured at 627–630 nm, half-maxima 622.3 / 636.4 (run A, 248 σ). 636
+    #    therefore clamps 0.4 nm BLUE of the red half-maximum: the stored band is TRUNCATED, and on the Yuji
+    #    (run B) it is truncated hard — there A(λ) is still at 83 % of its peak at 640 nm and does not fall
+    #    below half until past 644. ⇒ NEVER derive a band width, FWHM or red-flank shape from a spectrum
+    #    captured under this clamp; the fall-off at the right edge is the WINDOW, not the pigment.
+    #  * 641–645 nm was the red baseline anchor that made run A's amplitude measurable (ΔA = 0.060). It is
+    #    outside the window now, so that measurement cannot be repeated without widening this constant again.
+    #
+    # ⭐ The band itself is REAL and none of the above is in doubt: it survived a lamp swap. The Sansi V2 and
+    # the Yuji put their own sharp edges 3 nm apart (614.0 vs 610.9 nm) while the band stayed at 627.3 / 629.7,
+    # and the two references cross-correlate at 0.00 nm in the Q region, so the rig did not move. Lamp
+    # structure moves with the lamp; this does not.
+    #
+    # Nothing SHIPPED needs the lost stretch: the reddest declaredEvalBand() edge is 630.0 (PB_BASELINE_WINDOWS'
+    # far anchor), 6 nm inside this clamp. The loss is to future characterisation of the band, not to the
+    # current metrics. If the plot cosmetics are what matter, the cleaner fix is a display-only x-range on
+    # SpectrumPlotView (model field + toJson/fromJson + both renderers) — then the data stays and only the
+    # drawing is clipped.
+    #
+    # ⚠ The per-pixel nm mapping does not change (the ROI just spans a different column count), so samples
+    # inside the existing bands are the same pixels — PB_R_Q and the gauge thresholds keep their meaning. But
+    # the colour chips do NOT: EvaluationColorUtil integrates the whole curve, so the COLOUR row is not
+    # comparable across a window change. The ratio metrics are.
     WAVELENGTH_MIN_NM = 440.0
-    WAVELENGTH_MAX_NM = 630.0
+    WAVELENGTH_MAX_NM = 636.0
 
     def evaluation(self, workflow):
         # Compose the GENERIC ops (SpectrumFeatureUtil) with the pumpkin constants above → render-only
