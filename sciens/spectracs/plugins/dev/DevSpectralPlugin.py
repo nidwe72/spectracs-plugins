@@ -5,11 +5,15 @@ from sciens.spectracs.plugin_sdk import (
     LimsPublishView, GaugeRender,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     EvaluationColorUtil, MetadataField,
-    NavigationMode, NavigationPolicy, WorkflowPolicy,
+    NavigationMode, NavigationPolicy, WorkflowPolicy, LegendPosition,
     REFERENCE, SAMPLE, TRANSMISSION, ABSORPTION,
 )
-from sciens.spectracs.plugins.dev.RoastGaugeView import RoastGaugeView
-from sciens.spectracs.plugins.dev.RoastBaselineGaugeView import RoastBaselineGaugeView
+# ⚠ RoastGaugeView (T = 4.4, raw Soret/Q) and RoastBaselineGaugeView (T = 10.6, 600-630 anchor) are the two
+# ampeln §16.20 RETIRED, and their imports are gone from here (SPEC_soret_448_trim.md §5, D-deadgauges). They
+# were imported but never instantiated, which made two stale thresholds look current. The classes survive —
+# tests build them, and RoastBaselineGaugeView still documents the 600-630 scale — but nothing renders them,
+# and their thresholds were deliberately NOT re-derived for the 448 window: maintaining a scale nobody reads
+# is how a wrong number gets quoted years later.
 from sciens.spectracs.plugins.dev.RoastPedestalGaugeView import RoastPedestalGaugeView
 from sciens.spectracs.plugins.dev.RoastFar620GaugeView import RoastFar620GaugeView
 
@@ -26,7 +30,18 @@ class DevSpectralPlugin(SpectralPlugin):
     # preview + the METADATA form. The temporary SIMPLIFIED_NAVIGATION regression toggle was removed 2026-07-25
     # after the as-is path was rig-verified (Edwin); there is no as-is branch any more.
 
-    FRAMES = 150  # burst per capture (Edwin 2026-07-15): the bench averages 150 frames for a cleaner spectrum.
+    # Burst per capture. 150 -> 60 (Edwin 2026-08-10, SPEC_soret_448_trim.md §11). Frame averaging attacks only
+    # TEMPORAL noise, as 1/sqrt(N), so this costs sqrt(150/60) = 1.58x on that one term — and §16.26.1 measured
+    # the WHOLE instrument floor at 0.42 % of M (null run 003, nothing moved between the two bursts) against a
+    # careful-reseat rms of 4.47 % and an archive CV of 3-5 %. ⇒ worst case 0.42 -> 0.66 %, still ~7x below the
+    # term that actually limits the measurement; and it is an over-estimate, because 003's 0.42 % also contains
+    # lamp/AE drift that more frames never fix.
+    # ⭐ What it buys: ~5 s -> ~2 s per burst, i.e. ~2.5x less time IN THE BEAM — §16.22.1a measured the sample
+    # at <=40 °C in-beam with 3-5x faster degradation there, and §16.11.16 made "measure within the hour" a
+    # verdict rule. It also makes §16.11.17's decay-rate run (0/1/2/4/24 h in one evening) affordable.
+    # ⚠ Does NOT invalidate a threshold derived on the 150-frame archive: averaging changes VARIANCE, not the
+    # expectation, so there is no bias — only slightly wider class spreads (see the gauge docstrings).
+    FRAMES = 60
     # CapturePanel seeds its frame count from this declared value; the frame-count dropdown (when shown) overrides.
 
     def declaredEvalBands(self):
@@ -114,10 +129,15 @@ class DevSpectralPlugin(SpectralPlugin):
         # axis="dn": these are RAW capture spectra. On a linear axis the dim-but-healthy range collapses into
         # the bottom 4% and a fine 60 DN band reads as "nothing" — which caused a mis-dilution on 2026-07-27
         # (SPEC_capture_quality.md §16.7.2e). Transmission/absorbance below stay unitless: no axis flag.
-        spectraStep.setView(SpectrumPlotView(title="Reference vs Sample", axis="dn")
-                            .addTrace(meaned.getSpectra()[REFERENCE], "Reference", "c")
-                            .addTrace(meaned.getSpectra()[SAMPLE], "Sample", "y")
-                            .setShownInReport(True))
+        # SPEC_soret_448_trim.md §13: the DN guard is DECLARED here, not hard-coded in the renderers. Two
+        # dashed rejection edges (16 / 60) and a faint dotted target pair (20 / 40) — because the question at
+        # the bench is "am I in the window?", not "have I cleared the edge?": a fill at 17 DN is legal and bad.
+        spectraView = SpectrumPlotView(title="Reference vs Sample", axis="dn") \
+            .addTrace(meaned.getSpectra()[REFERENCE], "Reference", "c") \
+            .addTrace(meaned.getSpectra()[SAMPLE], "Sample", "y")
+        for level in self.dnLevels():
+            spectraView.addLevel(*level)
+        spectraStep.setView(spectraView.setShownInReport(True))
 
         transmissionStep = SpectralWorkflowStep()
         transmissionStep.setLabel("Transmission")
@@ -173,7 +193,30 @@ class DevSpectralPlugin(SpectralPlugin):
     # (NOT the legacy peak-ratio machinery): the 440-460 Soret right-hand slope and the 560-580 Q-band, with the
     # shared 510-540 clarity floor (= GREEN_BAND) as the stable-denominator comparison. Both new windows sit
     # inside the 440-630 capture clamp, so no window change (they are added to declaredEvalBands below).
-    PB_SORET_BAND = (440.0, 460.0)    # Soret right-hand slope = green-pigment blue absorption
+    # ⚠⚠ `PB_SORET_BAND_LEGACY_440` MUST KEEP MEANING 440-460 FOREVER — the same rule, and the same reason, as
+    # `PB_BASELINE_WINDOWS_LEGACY_600` below. Every §16 number published before 2026-08-10 was measured on this
+    # window, and the archive-reproducing diagnostics (`settling_sweep.py` above all, which derives the
+    # reference metric every comparison table is built on) read it. Repointing it would silently redefine them.
+    PB_SORET_BAND_LEGACY_440 = (440.0, 460.0)
+
+    # --- THE TRIM: 440-460 -> 448-460 (SPEC_metric_research.md §7.13 S1, adopted Edwin 2026-08-04; shipped
+    # 2026-08-10, SPEC_soret_448_trim.md). `DOC_pedestal_correction.md` §7 established that the 440-447 bins
+    # read 2.0-2.6 DN against a reference near 88 — "they are not measurements" — and they sat inside this
+    # window, so a third of the numerator was fed by bins the project had already written off.
+    #
+    # Measured effect of dropping them (§7.13.2/§7.13.3, whole archive): class d 6.91 -> 7.37, within-green
+    # d 1.21 -> 1.34, dilution spread 10.3 % -> 8.8 %, and the pedestal anomaly's significance t 4.43 -> 2.92.
+    # Post-rebuild it holds up: §16.28.2a transfers `M448 + pedestal` across a LAMP SWAP at 3 % (against 51 %
+    # for the raw ratio), and §16.27.5's Cohen's d is better on M448 for all three oil pairs.
+    #
+    # ⚠ What it is NOT: §16.28.3 measured M448 WORSE on run-to-run repeatability in 8 of 10 fills (~20 %
+    # relative). ⇒ it is specifically an ILLUMINATION-robustness device — better on discrimination and on
+    # lamp/exposure transfer, not on re-seating noise. Ship it for what it is.
+    #
+    # ⚠ `B_Soret` falls ~x0.65-0.67, so BOTH gauge scales moved with it — see their docstrings. The factor is
+    # class-dependent (0.642 brown .. 0.672 green, §16.27), which is exactly WHY the trim improves d, and also
+    # why the thresholds were re-derived on the archive rather than rescaled by a single number.
+    PB_SORET_BAND = (448.0, 460.0)    # Soret right-hand slope = green-pigment blue absorption
     PB_Q_BAND = (560.0, 580.0)        # green-pigment Q-band
 
     # --- SPEC_capture_quality.md §16.10.2/§16.10.9: the two anchor windows the linear baseline is fitted
@@ -238,6 +281,45 @@ class DevSpectralPlugin(SpectralPlugin):
     # should own it (per-instrument, stored on the instrument record, re-measured after any rig change), and
     # §16.17.8 blocker 6 records what must be settled first.
     PB_R_Q = -0.0184
+
+    # --- SPEC_soret_448_trim.md §12/§14 — the EVALUATION plot's own palette. Anchors are drawn in a different
+    # shade from measurement bands so a reader can tell "this window feeds the LINE" from "this window feeds
+    # the RATIO" without reading the captions. RGBA for the shading (pyqtgraph brush + matplotlib alpha both
+    # accept a hex string), plain hex for the bars.
+    # ⚠ Every colour here must read on BOTH grounds: the app draws on a dark plot, the PDF on white paper, and
+    # M2's contract is that the preview IS the PDF. Mid-tones only — a near-white bar is invisible on paper and
+    # a near-black one is invisible on screen. (First cut used #e8e8e8 for the bars; it vanished in the report.)
+    __ANCHOR_SHADE = "#5a6a7a55"      # baseline anchors: cool, recessive
+    __RAW_COLOR = "#e8e337"           # A(λ) despiked — the measurement
+    __CORRECTED_COLOR = "#35d3d3"     # A(λ) − baseline — what the metric is read on
+    __BASELINE_COLOR = "#d08a2c"      # the fitted 520-540 / 620-630 line (dashed)
+    # ⭐ A BAR WEARS THE COLOUR OF THE CURVE IT WAS MEASURED ON (SPEC_soret_448_trim.md §25.1). That one rule
+    # is what makes two overlaid curves safe: ownership is readable without a caption.
+    __METRIC_BAR = __CORRECTED_COLOR  # ① Soret and ② Q — measured on the SUBTRACTED curve
+    __ANCHOR_BAR = "#c9a227"          # ③ red and ④ quiet anchor — measured on the RAW curve
+
+    # --- SPEC_soret_448_trim.md §13 — THE DN GUARD, now plugin-owned data rather than a renderer constant.
+    # §16.23.8 states it two-sided and this plugin is where the numbers belong: the guards are the REJECTION
+    # edges (below 16 too concentrated, above ~60 too dilute) and the target pair is where a fill should
+    # actually land. Both are declared on the Reference-vs-Sample plot AND handed to the live capture preview
+    # via CaptureView, so the operator, the screen and the PDF quote one set of numbers.
+    # ⚠ Read in DISPLAY DN (axis="dn"), which is where the operator judges dilution — not gamma-decoded again.
+    DN_GUARD_LOW = 16.0               # below: quantization-limited, the bin is not a measurement (§17.6/11)
+    DN_GUARD_HIGH = 60.0              # above: too dilute — the band stops carrying absorbance
+    DN_TARGET_LOW = 20.0              # the window a fill should land in (§16.23.8)
+    DN_TARGET_HIGH = 40.0
+    __GUARD_COLOR = "#c87a3c"
+    __TARGET_COLOR = "#6b7f5a"
+
+    def dnLevels(self):
+        # The four DN lines, built ONCE and handed to both consumers: the PROCESSING Reference-vs-Sample plot
+        # and the SAMPLE capture step's live preview. Two weights on purpose — dashed = the REJECTION edges,
+        # dotted = the target window — because the question at the bench is "am I in the window?", not "have I
+        # cleared the edge?": §16.23.8 makes a fill at 17 DN legal and bad.
+        return [(self.DN_GUARD_LOW, None, None, "16 DN — too concentrated", self.__GUARD_COLOR, "dashed", None),
+                (self.DN_GUARD_HIGH, None, None, "60 DN — too dilute", self.__GUARD_COLOR, "dashed", None),
+                (self.DN_TARGET_LOW, None, None, None, self.__TARGET_COLOR, "dotted", None),
+                (self.DN_TARGET_HIGH, None, None, "20–40 DN target", self.__TARGET_COLOR, "dotted", None)]
 
     # Hue-normalized colour chips: a fixed, CALM S/L so only HUE varies between oils (SPEC_capability_proof.md §5,
     # "C scheme" — Edwin 2026-07-22). Lowered from the original vivid 80/50 to a darker, less "popping" pair.
@@ -309,8 +391,14 @@ class DevSpectralPlugin(SpectralPlugin):
         # M2 (Edwin): the EVALUATION band-marked absorption spectrum is also rendered in the PDF report.
         spectrumStep = SpectralWorkflowStep()
         spectrumStep.setLabel("Absorption (bands, dev)")   # §7b rename (was "Spectrum" — legacy band plot)
+        # F1/B4 (SPEC_soret_448_trim.md §8.2): Q_BASELINE is now marked too. D_Q — and therefore this tab's
+        # headline "Greenness G" — is a peak height above the CHORD drawn across 555-600, and marking only
+        # where the peak is SEARCHED while hiding what it is measured AGAINST was the tab's own defect B4.
         spectrumStep.setView(SpectrumPlotView(absorption, title="A(λ) — bands")
-                             .addBand(*self.BLUE_BAND).addBand(*self.GREEN_BAND).addBand(*self.Q_SEARCH)
+                             .addBand(*self.BLUE_BAND, "blue")
+                             .addBand(*self.GREEN_BAND, "clarity")
+                             .addBand(*self.Q_SEARCH, "Q search")
+                             .addBand(*self.Q_BASELINE, "D_Q chord", self.__ANCHOR_SHADE)
                              .addMarker(qLambda, "Q").setShownInReport(True))
 
         # V3 (SPEC_capability_proof.md §2.1): a SECOND, forward-looking evaluation view — the PB literature bands
@@ -331,9 +419,7 @@ class DevSpectralPlugin(SpectralPlugin):
         newQLambda = newPeak[0] if newPeak is not None else 570.0
         newSpectrumStep = SpectralWorkflowStep()
         newSpectrumStep.setLabel("Absorption (bands)")   # §7b rename (was "Spectrum (new)" — the PB-band A(λ) plot)
-        newSpectrumStep.setView(SpectrumPlotView(despikedAbsorption, title="A(λ) — PB bands (despiked)")
-                                .addBand(*self.PB_SORET_BAND).addBand(*self.GREEN_BAND).addBand(*self.PB_Q_BAND)
-                                .addMarker(newQLambda, "Q").setShownInReport(True))
+        newSpectrumStep.setView(self.__bandPlot(despikedAbsorption, newQLambda))
 
         # M2 (SPEC_bench_pdf_export.md §1): declare a Report step. Its ReportView surfaces as a tab in EVALUATION
         # (beside Metrics | Spectrum) whose body the host renders with matplotlib (a preview that IS the PDF) +
@@ -385,6 +471,69 @@ class DevSpectralPlugin(SpectralPlugin):
                        "group": "Spectroscopy"}],
             backend="senaite", configKey="SENAITE"))
         phase.addToSteps(step)
+
+    def __bandPlot(self, despikedAbsorption, qLambda):
+        # SPEC_soret_448_trim.md §12.3/§12.4/§14 — the EVALUATION picture, declared entirely through the
+        # view-model (no renderer knows anything about pumpkin oil).
+        #
+        # ⭐ THE IDENTITY THIS IS BUILT ON:  mean(curve over band) - mean(fitted line over band) = B_band.
+        # So a BAR at the band mean of the PLOTTED curve, with the fitted baseline drawn beneath it, makes the
+        # vertical gap between them the very number the gauges divide. The two `· baseline` metric rows stop
+        # being numbers a reader must trust and become a distance on screen.
+        #
+        # ⚠ The bars MUST be fed the mean of the plotted (despiked) curve — NOT the baselined mean. Passing
+        # far620Soret here would draw the bar below where the curve actually is and nothing would error; the
+        # picture would silently stop being true. `tests/test_band_bar_identity.py` is what catches it.
+        #
+        # ⚠ The 510-540 clarity band is deliberately NOT shaded here (§14): a single grey block at 510-540 was
+        # being read as the 520-540 baseline anchor and was wrong by 10 nm on the left edge (defect B2). The
+        # `Clarity · 510-540 nm` metric row is unaffected — only the shading is gone.
+        util = SpectrumFeatureUtil()
+        near, far = self.PB_BASELINE_WINDOWS
+        fit = util.fittedBaseline(despikedAbsorption, self.PB_BASELINE_WINDOWS)
+        corrected = util.linearBaselineCorrected(despikedAbsorption, self.PB_BASELINE_WINDOWS)
+        # ⚠ The measured curve is declared as a TRACE, not as the view's primary spectrum: only a trace can
+        # carry a label, and the legend names every curve by text in its own colour. A primary with no label
+        # would have left the yellow curve as the one unnamed thing on the plot.
+        view = SpectrumPlotView(title="A(λ) — PB bands (despiked)")
+        view.setLegend(LegendPosition.NORTH_EAST, padding=34.0)
+        view.addTrace(despikedAbsorption, "A(λ) despiked", self.__RAW_COLOR)
+
+        # ⭐ THE TWO CURVES. The subtracted one is what the verdict actually reads, so it is drawn rather than
+        # left to be imagined — and the two are 6..46 px apart on a bench-sized plot (measured, §24.1), so the
+        # overlay is legible. The fitted baseline is dashed: it reads as CONSTRUCTION, not as a measurement.
+        # ⭐ It rises to the red on real oil, and that is not scattering (which falls with λ): it is §16.12.12's
+        # finding that the far anchor MEASURES, sitting on protochlorophyll's Qy band.
+        if corrected is not None:
+            view.addTrace(corrected, "A(λ) − baseline", self.__CORRECTED_COLOR)
+        if fit is not None:
+            view.addTrace(fit, "fitted baseline (520–540 / 620–630)", self.__BASELINE_COLOR, style="dashed")
+
+        # ⭐⭐ THE RULE (Edwin, §25.1): A BAR SITS ON THE CURVE THAT GIVES IT MEANING.
+        #   ① Soret and ② Q  -> the SUBTRACTED curve: their heights ARE B_Soret and B_Q, the two numbers the
+        #                       verdict divides (M = B_Soret / (B_Q − r_Q)).
+        #   ③ red and ④ quiet anchor -> the RAW curve: the anchors DEFINE the fitted line, and their bars
+        #                       landing on it is the plot's own running proof that the fit is anchored.
+        # ⚠ Feeding a bar the other curve would render plausibly and be WRONG — that is what
+        # `test_band_bar_identity` and the plugin-boundary test pin down.
+        for number, band, label, source, color in (
+                (1, self.PB_SORET_BAND, "Soret band mean", corrected, self.__METRIC_BAR),
+                (2, self.PB_Q_BAND, "Q-band mean", corrected, self.__METRIC_BAR),
+                (3, far, "red-anchor mean", despikedAbsorption, self.__ANCHOR_BAR),
+                (4, near, "quiet-anchor mean", despikedAbsorption, self.__ANCHOR_BAR)):
+            mean = util.bandMean(source, *band) if source is not None else None
+            if mean is not None:
+                view.addLevel(mean, band[0], band[1], label=label, color=color, number=number)
+
+        # The four windows the metrics on this tab read, shaded. Captions stay (Edwin) — the anchors' captions
+        # are legible again now that they no longer inherit the recessive shading colour (§25.3).
+        for band, caption in ((self.PB_SORET_BAND, "S"), (near, "quiet anchor"),
+                              (self.PB_Q_BAND, "Q"), (far, "red anchor")):
+            view.addBand(*band, caption, self.__ANCHOR_SHADE if band in (near, far) else None)
+        # ⚠ The marker is labelled "λmax", NOT "Q": it sits inside the Q band, so two captions reading "Q" a
+        # few nm apart is what the plot showed before numbering (§22.1's duplicate-caption defect). This one
+        # names what the line actually is — the local maximum's wavelength.
+        return view.addMarker(qLambda, "λmax").setShownInReport(True)
 
     def __pedestalRatio(self, workflow):
         # SPEC_roast_ampel.md §8.6 / SPEC_capture_quality.md §16.20 — the PRIMARY pigment index: the 620-630
@@ -562,8 +711,11 @@ class DevSpectralPlugin(SpectralPlugin):
         if colourChips:
             for chip in colourChips:
                 result.addItem(chip)
-        result.addItem(MetricFieldView("Soret · 440–460 nm", fmt(soret),
-            "mean absorbance over the 440–460 nm Soret right-hand slope (green-pigment blue absorption)."))
+        result.addItem(MetricFieldView("Soret · 448–460 nm", fmt(soret),
+            "mean absorbance over the 448–460 nm Soret right-hand slope (green-pigment blue absorption). "
+            "The window starts at 448, not 440: the 440–447 bins read 2.0–2.6 DN against a reference near 88 "
+            "and are not measurements — dropping them improved class separation, the within-green task and "
+            "dilution spread at once (SPEC_metric_research.md §7.13)."))
         result.addItem(MetricFieldView("Q · 560–580 nm", fmt(qBand),
             "mean absorbance over the 560–580 nm green-pigment Q-band."))
         result.addItem(MetricFieldView("Clarity · 510–540 nm", fmt(clarity),
@@ -573,12 +725,13 @@ class DevSpectralPlugin(SpectralPlugin):
             "discriminator candidate. ⚠ the Q band is weak on this rig (§13/F7) — watch its run-to-run stability.",
             style=dilutionInvariant))
         result.addItem(MetricFieldView("Pigment ratio · clarity", fmt(ratio(soret, clarity)),
-            "Soret ÷ clarity-floor on the NEW bands (440–460 / 510–540) — the stable-denominator safety net for "
+            "Soret ÷ clarity-floor on the NEW bands (448–460 / 510–540) — the stable-denominator safety net for "
             "the pigment ratio; dilution-invariant.", style=dilutionInvariant))
         # §16.10.9 — the linear-baseline rows. The two band means are emitted beside the ratio so a reader can
         # see WHAT the correction did to each band, not just its effect on the quotient.
         result.addItem(MetricFieldView("Soret · baseline", fmt(far620Soret),
-            "mean 440–460 absorbance measured above the fitted 520–540/620–630 baseline, not above zero."))
+            "mean 448–460 absorbance measured above the fitted 520–540/620–630 baseline, not above zero. "
+            "On the Absorption (bands) plot this is the vertical GAP between the S bar and the dashed line."))
         result.addItem(MetricFieldView("Q · baseline", fmt(far620Q),
             "mean 560–580 absorbance measured above the same fitted baseline."))
         # §16.20 — THE THIRD VERDICT, deliberately a VALUE WITH NO GAUGE. On post-rebuild data the raw ratio
@@ -719,10 +872,18 @@ class DevSpectralPlugin(SpectralPlugin):
         # frame-count + exposure/auto-exposure controls stay HIDDEN (the default) — auto-exposure runs under the
         # hood; the plugin can opt them in via setShowFramesControl/setShowExposureControls when needed.
         # SPEC_acquisition_guidance.md P4: `prompt` is now role-specific (Reference vs Sample).
+        # SPEC_soret_448_trim.md §25.4: the SAME four DN lines the Spectra plot and the PDF draw are handed to
+        # the LIVE preview — that is where the dosing decision is actually made, so it is the one plot that
+        # must not carry a stale private constant.
+        # ⭐ SAMPLE ONLY (Edwin 2026-08-10). §16.23.8 states the guard on min(S) after the SAMPLE capture; the
+        # reference is a solvent blank whose level is set by auto-exposure and judged against R ≈ 88. Drawing
+        # 16/60 DN on the reference asserted a rule that does not apply there — and invited the operator to
+        # "fix" a reference that was never wrong.
         step.setView(CaptureView(prompt=prompt,
                                  captureLabel="Capture " + label.lower(), geometry="transmission",
                                  wavelengthMinNm=self.WAVELENGTH_MIN_NM, wavelengthMaxNm=self.WAVELENGTH_MAX_NM,
-                                 croppedPreview=True))  # Change A: cropped-ROI live preview (permanent, phase X)
+                                 croppedPreview=True,  # Change A: cropped-ROI live preview (permanent, phase X)
+                                 levels=(self.dnLevels() if role == SAMPLE else [])))
         # M2 (SPEC_bench_pdf_export.md §5b): declare that this role's captured frame belongs in the PDF report
         # (cropped to the ROI). The plugin declares presence + flag; the HOST fills `.image` with the hardware
         # pixels after capture, embeds it as a named attachment, and draws it on the page. Alongside it, declare

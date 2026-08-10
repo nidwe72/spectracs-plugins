@@ -119,7 +119,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
         self.assertIsNotNone(step, "the Evaluation (new) step")
         labels = [i.label for i in step.getEvaluationResult().getItems()
                   if isinstance(i, MetricFieldView) and i.color is None]
-        for expected in ("Soret · 440–460 nm", "Q · 560–580 nm", "Clarity · 510–540 nm",
+        for expected in ("Soret · 448–460 nm", "Q · 560–580 nm", "Clarity · 510–540 nm",
                          "Pigment ratio", "Pigment ratio · clarity"):
             self.assertIn(expected, labels, expected)
 
@@ -131,12 +131,84 @@ class DevPluginImprovedColourTest(unittest.TestCase):
         self.assertEqual(len(chips), 10, "the full 10-variant colour set, duplicated")
 
     def test_second_band_marked_spectrum_uses_the_pb_bands(self):
+        # SPEC_soret_448_trim.md §14 — the plot must shade EXACTLY the windows this tab's metrics read: the
+        # trimmed Soret, the Q band, and BOTH baseline anchors. ⚠ 510-540 (clarity) is deliberately absent:
+        # one grey block at 510-540 was being read as the 520-540 anchor and was wrong by 10 nm (defect B2).
+        # The clarity metric ROW is unaffected — asserted above.
         workflow = self.__runPlugin()
         step = self.__evalStep(workflow, "Absorption (bands)")
         self.assertIsNotNone(step, "the Spectrum (new) step")
-        bands = step.getView().bands  # list of (lowNm, highNm[, label])
+        bands = step.getView().bands  # list of (lowNm, highNm, label, color)
         windows = {(round(b[0]), round(b[1])) for b in bands}
-        self.assertEqual(windows, {(440, 460), (510, 540), (560, 580)})
+        self.assertEqual(windows, {(448, 460), (520, 540), (560, 580), (620, 630)})
+        self.assertEqual({b[2] for b in bands}, {"S", "quiet anchor", "Q", "red anchor"})
+
+    def test_the_band_plot_overlays_the_subtracted_curve_and_the_fitted_baseline(self):
+        # SPEC_soret_448_trim.md §25.1 — three curves: the measurement, what the verdict reads, and the
+        # construction that connects them (dashed, so it reads as construction).
+        workflow = self.__runPlugin()
+        view = self.__evalStep(workflow, "Absorption (bands)").getView()
+        labels = [trace[1] for trace in view.allTraces()]
+        self.assertIn("A(λ) − baseline", labels)
+        dashed = [trace for trace in view.allTraces() if trace[3] == "dashed"]
+        self.assertEqual(len(dashed), 1, "the fitted baseline, dashed so it reads as construction")
+
+    def test_each_bar_is_measured_on_the_curve_that_gives_it_meaning(self):
+        # ⭐⭐ THE RULE (Edwin, §25.1) and the one failure that would render plausibly while being wrong:
+        #   S / Q  -> the SUBTRACTED curve (their heights ARE B_Soret and B_Q, the numbers M divides)
+        #   anchors -> the RAW curve (they DEFINE the fitted line; their bars landing on it is the proof)
+        # Swap either source and nothing errors — the picture just stops being true.
+        from sciens.spectracs.plugin_sdk import SpectrumFeatureUtil
+        workflow = self.__runPlugin()
+        view = self.__evalStep(workflow, "Absorption (bands)").getView()
+        util, plugin = SpectrumFeatureUtil(), DevSpectralPlugin()
+        raw = view.allTraces()[0][0]   # the measured curve is a labelled TRACE now, not the primary
+        corrected = util.linearBaselineCorrected(raw, plugin.PB_BASELINE_WINDOWS)
+        onCorrected = {1: plugin.PB_SORET_BAND, 2: plugin.PB_Q_BAND}
+        bars = {level[6]: level for level in view.levels if level[6] is not None}
+        self.assertEqual(sorted(bars), [1, 2, 3, 4], "four numbered bars")
+        for number, level in bars.items():
+            source = corrected if number in onCorrected else raw
+            self.assertAlmostEqual(level[0], util.bandMean(source, level[1], level[2]), places=9,
+                                   msg="bar %d is measured on the wrong curve" % number)
+        # ⚠ and the anchors' bars must land ON the fitted line — i.e. ~0 once the baseline is removed.
+        # RELATIVE to the numerator, deliberately: the fit is an equal-weight LSQ through every anchor point,
+        # not a two-point chord, so the residual depends on how curved the curve is INSIDE the window (§18
+        # duck #1). On real archive data it is 0.0004 — 0.05 % of B_Soret; on this synthetic stand-in, whose
+        # anchor windows are far more curved, it is ~2 %. An absolute tolerance would encode the fixture.
+        soret = util.bandMean(corrected, *plugin.PB_SORET_BAND)
+        for number in (3, 4):
+            level = bars[number]
+            self.assertLess(abs(util.bandMean(corrected, level[1], level[2])), 0.05 * abs(soret),
+                            msg="anchor %d drifted off the fitted line" % number)
+
+    def test_the_band_plot_declares_a_numbered_legend_in_the_north_east(self):
+        from sciens.spectracs.plugin_sdk import LegendPosition
+        workflow = self.__runPlugin()
+        view = self.__evalStep(workflow, "Absorption (bands)").getView()
+        self.assertEqual(view.legendPosition, LegendPosition.NORTH_EAST)
+        self.assertGreater(view.legendPadding, 0, "a MAGNITUDE — the renderer owns the sign")
+        rows = view.legendRows()
+        # numbered bars first, ascending; then the curves, which carry no number and are named by colour
+        self.assertEqual([row[0] for row in rows[:4]], [1, 2, 3, 4])
+        self.assertEqual([row[1] for row in rows[:4]],
+                         ["Soret band mean", "Q-band mean", "red-anchor mean", "quiet-anchor mean"])
+        self.assertTrue(all(row[0] is None and row[2] for row in rows[4:]), "curves: no badge, own colour")
+
+    def test_the_dn_guard_is_declared_on_the_SAMPLE_step_only(self):
+        # SPEC_soret_448_trim.md §25.4 — §16.23.8 states the guard on min(S) after the SAMPLE capture; the
+        # reference is a solvent blank judged against R ~ 88, so 16/60 DN never applied to it.
+        from sciens.spectracs.plugin_sdk import REFERENCE as REF, SAMPLE as SMP
+        workflow = self.__runPlugin()
+        processing = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
+        step = next(s for s in processing.getSteps().values() if s.getLabel() == "Spectra")
+        self.assertEqual({level[0] for level in step.getView().levels}, {16.0, 60.0, 20.0, 40.0})
+        byRole = {s.getRole(): s.getView()
+                  for s in workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION).getSteps().values()}
+        self.assertEqual([level[0] for level in byRole[SMP].levels], [16.0, 60.0, 20.0, 40.0])
+        self.assertEqual(byRole[REF].levels, [], "the reference declares no DN guard")
+        # the captions travel WITH the values — one source of truth for the preview and the report
+        self.assertIn("16 DN — too concentrated", [level[3] for level in byRole[SMP].levels])
 
     def test_intrinsic_perceived_chip_is_the_white_point_complement(self):
         # SPEC_capability_proof.md option (b): the intrinsic-perceived hue must be the white-point complement of the

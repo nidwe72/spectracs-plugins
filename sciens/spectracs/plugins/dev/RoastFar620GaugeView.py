@@ -13,29 +13,43 @@ class RoastFar620GaugeView(VerdictGaugeView):
     # ─ WHAT THIS METRIC IS ──────────────────────────────────────────────────────────────────────────────────
     #   M = B_Soret / B_Q   with both bands taken above the 520-540 / 620-630 fitted line. Nothing added back.
     #
-    # ─ SCALE, measured on the POST-REBUILD archive (§16.20.4, 28 runs) ──────────────────────────────────────
-    #   green (Steirerkraft B+C, n=12)   15.559 +/- 0.615   all-green runs span 14.671 .. 18.356
-    #   brown (S-Budget series D, n=6)   10.160 +/- 0.197   all-brown runs span  9.957 .. 10.408
-    #   Cohen's d 10.35 — the BEST discrimination of the three, and of any window tested (§16.20.4)
-    #   EMPTY CORRIDOR 10.408 .. 14.671 (width 4.263 = 79 % of the class gap)
+    # ⚠⚠ THE SCALE MOVED ON 2026-08-10 — the Soret window was trimmed 440-460 -> 448-460 (`SPEC_soret_448_trim.md`).
+    # B_Soret is the numerator, so every number below is ~x0.68 of what this docstring used to say. ⛔ A value
+    # read before that date is on the OLD scale; compare verdicts, never numbers, across the cut-over.
     #
-    # ─ THE THRESHOLD: 12.5, DERIVED (§16.20.4) ──────────────────────────────────────────────────────────────
-    # The midpoint of the empty corridor, rounded: (10.408 + 14.671) / 2 = 12.54. Margins that follow:
-    #        green +4.91 sigma      brown +12.07 sigma
-    # This is a DERIVED line, not an inherited one — there was no predecessor on this scale to inherit from.
-    # It keeps §16.10.17d's policy shape (brown clears by more than green, so a false GREEN stays the harder
-    # error to make) without needing a policy nudge, because the corridor is wide enough on its own.
+    # ─ SCALE, RE-DERIVED on §16.20.4's own corpus, 448-460 window (`diagnostics/soret_448_thresholds.py`) ────
+    #   green (Steirerkraft B+C, n=12)   10.560 +/- 0.453   all-green runs span 9.895 .. 11.475
+    #   brown (S-Budget series D, n=6)    6.615 +/- 0.151   all-brown runs span 6.436 ..  6.796
+    #   Cohen's d 10.25 (was 10.35) — still the best discrimination of the three
+    #   EMPTY CORRIDOR 6.796 .. 9.895 (width 3.098 = 78 % of the class gap)
+    #
+    # ─ THE THRESHOLD: 8.3, DERIVED ──────────────────────────────────────────────────────────────────────────
+    # The midpoint of the empty corridor, rounded: (6.796 + 9.895) / 2 = 8.35. Margins that follow:
+    #        green +4.99 sigma      brown +11.16 sigma      (was +4.91 / +12.07 at T = 12.5 on 440-460)
+    # Derived on its own scale, exactly as its predecessor was — the construction is unchanged, only the
+    # numerator window moved. It keeps §16.10.17d's policy shape (brown clears by more than green, so a false
+    # GREEN stays the harder error to make) without needing a policy nudge.
+    #
+    # ─ WHAT CHANGED VERDICT ─────────────────────────────────────────────────────────────────────────────────
+    # ⭐ 0 of the 18 derivation-corpus runs change class. Outside it, ONE does: `Steirerkraft A aged 24 h` run 1
+    # moves green -> brown. ⭐ That is a CORRECTION, not a regression — §16.11.16 established that fill as a
+    # genuinely browner oil (Qy -17 % / 572 nm +14 % per unit Soret, demetallation) whose 3 runs the old scale
+    # misclassified as green. The trimmed window catches one of the three. The other two still read green here
+    # and brown on the pedestal gauge, so "measure within the hour" remains a VERDICT rule, not a fixed defect.
+    #
+    # ⚠ FRAME COUNT: the corpus is 150-frame; the app now captures 60 (§11). Averaging changes variance, not
+    # expectation, so the corridor stands and the sigma margins are marginally optimistic.
     #
     # ⚠ PROVISIONAL for the same reasons as its siblings: three oils, one rig state, and the anchor itself is
     # a 2026-08 proposal that §16.20.3 has NOT cleared for the end-user verdict. Bench instrument only.
-    __THRESHOLD = 12.5
+    __THRESHOLD = 8.3
 
     _GOOD = {"text": "#FFFFFF", "bg": "#2f3b1f"}      # white on dark-green chip — matches its siblings
     _BROWN = {"text": "#FFFFFF", "bg": "#3b241f"}     # white on dark-brown chip
-    _ANCHORS = [(19.0, "#9B9E57"), (12.5, "#8B8952"), (11.5, "#6E4A22"), (9.0, "#442C0E")]
+    _ANCHORS = [(12.0, "#9B9E57"), (8.3, "#8B8952"), (7.6, "#6E4A22"), (6.0, "#442C0E")]
     _THRESHOLDS = [__THRESHOLD]
-    _BAND_LEFT = 19.0       # headroom past the highest green observed (18.356)
-    _BAND_RIGHT = 9.0       # headroom past the lowest brown observed (9.957)
+    _BAND_LEFT = 12.0       # headroom past the highest green observed (11.475)
+    _BAND_RIGHT = 6.0       # headroom past the lowest brown observed (6.436)
 
     def __init__(self, value, render, caption="Verdict · baseline"):
         classes = [{"label": "good — green", "colors": self._GOOD},
