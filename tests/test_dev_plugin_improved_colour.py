@@ -197,18 +197,29 @@ class DevPluginImprovedColourTest(unittest.TestCase):
 
     def test_the_dn_guard_is_declared_on_the_SAMPLE_step_only(self):
         # SPEC_soret_448_trim.md §25.4 — §16.23.8 states the guard on min(S) after the SAMPLE capture; the
-        # reference is a solvent blank judged against R ~ 88, so 16/60 DN never applied to it.
+        # reference is a solvent blank judged against R ~ 88, so the dosing rule never applied to it.
+        #
+        # ⭐ UPDATED 2026-08-12 (SPEC_capture_quality.md §16.23.10): the four lines {16, 60, 20, 40} became the
+        # single target pair {20, 50}. The 16/60 REJECTION EDGES are no longer drawn — across 34 archive runs
+        # the minimum ever observed was 37.6 DN, so they only added ink to the plot the operator actually
+        # reads; the 16 CHECK moved to the host's CAPTURE-LOWDN log line. The target moved 40 -> 50 because
+        # §16.23.8's justification for 20-40 (the A = 0.434 optimum via "R ≈ 88 ⇒ S ≈ 32 DN") is LINEAR
+        # arithmetic applied to ENCODED thresholds and does not survive (§16.23.10b).
         from sciens.spectracs.plugin_sdk import REFERENCE as REF, SAMPLE as SMP
         workflow = self.__runPlugin()
         processing = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
         step = next(s for s in processing.getSteps().values() if s.getLabel() == "Spectra")
-        self.assertEqual({level[0] for level in step.getView().levels}, {16.0, 60.0, 20.0, 40.0})
+        self.assertEqual({level[0] for level in step.getView().levels}, {20.0, 50.0})
         byRole = {s.getRole(): s.getView()
                   for s in workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION).getSteps().values()}
-        self.assertEqual([level[0] for level in byRole[SMP].levels], [16.0, 60.0, 20.0, 40.0])
+        self.assertEqual([level[0] for level in byRole[SMP].levels], [20.0, 50.0])
         self.assertEqual(byRole[REF].levels, [], "the reference declares no DN guard")
         # the captions travel WITH the values — one source of truth for the preview and the report
-        self.assertIn("16 DN — too concentrated", [level[3] for level in byRole[SMP].levels])
+        self.assertIn("20–50 DN target (provisional)", [level[3] for level in byRole[SMP].levels])
+        # ⚠ and the window/rule/colours ride along on the SAMPLE step only (§16.23.10f)
+        self.assertEqual(byRole[SMP].guardBandNm, (448.0, 460.0))
+        self.assertEqual(byRole[SMP].guardTargetDn, (20.0, 50.0))
+        self.assertIsNone(byRole[REF].guardBandNm)
 
     def test_intrinsic_perceived_chip_is_the_white_point_complement(self):
         # SPEC_capability_proof.md option (b): the intrinsic-perceived hue must be the white-point complement of the

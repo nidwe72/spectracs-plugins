@@ -305,21 +305,49 @@ class DevSpectralPlugin(SpectralPlugin):
     # via CaptureView, so the operator, the screen and the PDF quote one set of numbers.
     # ⚠ Read in DISPLAY DN (axis="dn"), which is where the operator judges dilution — not gamma-decoded again.
     DN_GUARD_LOW = 16.0               # below: quantization-limited, the bin is not a measurement (§17.6/11)
-    DN_GUARD_HIGH = 60.0              # above: too dilute — the band stops carrying absorbance
-    DN_TARGET_LOW = 20.0              # the window a fill should land in (§16.23.8)
-    DN_TARGET_HIGH = 40.0
+    # --- REVISED 2026-08-12, SPEC_capture_quality.md §16.23.10 -----------------------------------------------
+    # ⭐ TARGET 20-40 -> 20-50, and the 16/60 REJECTION EDGES ARE NO LONGER DRAWN.
+    #
+    # ⛔ Why the old pair had to go: §16.23.8 justified 20-40 from the A = 1/ln10 = 0.434 optimum via
+    # "R ≈ 88 ⇒ S ≈ 32 DN". That arithmetic only closes in LINEAR units, and these thresholds are ENCODED
+    # (§16.23.10b, settled on `20260804A`). Converted properly the 0.434 optimum lands at ≈ 120 DN — past even
+    # the old "too dilute" line. The band was never in the space its own derivation assumed.
+    #
+    # ⚠ 20-50 is EDWIN'S WORKING WINDOW (§16.23.10e), not a derived one:
+    #   - fits the oil under test: BillaClever at 2 capillaries / 8 mL predicts 39.9 DN
+    #   - catches all 6 runs of `20260804A` (74-98 DN), the session §16.24.7 calls over-dilute
+    #   - ⛔ BUT the 8 archive runs whose `A_Q` is already correct span 48.6-66.6 DN — 7 of 8 read
+    #     "too dilute" against it
+    # ⛔ A fixed DN band CANNOT carry a dilution verdict across oils: guard-at-correct-dilution tracks the
+    # oil's own band ratio at r = -0.985, ~46 DN of drift over the observed range (§16.23.10d). This pair is a
+    # GROSS-ERROR ENVELOPE. The real criterion is `A_Q` ∈ 0.19-0.23 and it lives in EVALUATION.
+    #
+    # ⭐ 16 and 60 are no longer drawn: across 34 archive runs the minimum ever observed was 37.6 DN, so the
+    # rejection edges only added ink to the one plot the operator actually reads. The 16 CHECK survives in the
+    # host's CAPTURE-LOWDN log line, where it is the one thing that would catch a genuinely broken capture.
+    DN_TARGET_LOW = 20.0
+    DN_TARGET_HIGH = 50.0
+    # The window `min(S)` is taken over — the metric's own Soret window (§16.23.10f). ⚠ COUPLED: retrim
+    # PB_SORET_BAND and this guard moves with it, silently. Accepted by Edwin; recorded so it is not
+    # rediscovered as a bug.
+    DN_GUARD_BAND = PB_SORET_BAND
     __GUARD_COLOR = "#c87a3c"
     __TARGET_COLOR = "#6b7f5a"
+    # The measured reading is painted green inside the target pair, red outside (§16.23.10f).
+    __MEASURED_INSIDE_COLOR = "#2ECC71"
+    __MEASURED_OUTSIDE_COLOR = "#E74C3C"
 
     def dnLevels(self):
-        # The four DN lines, built ONCE and handed to both consumers: the PROCESSING Reference-vs-Sample plot
-        # and the SAMPLE capture step's live preview. Two weights on purpose — dashed = the REJECTION edges,
-        # dotted = the target window — because the question at the bench is "am I in the window?", not "have I
-        # cleared the edge?": §16.23.8 makes a fill at 17 DN legal and bad.
-        return [(self.DN_GUARD_LOW, None, None, "16 DN — too concentrated", self.__GUARD_COLOR, "dashed", None),
-                (self.DN_GUARD_HIGH, None, None, "60 DN — too dilute", self.__GUARD_COLOR, "dashed", None),
-                (self.DN_TARGET_LOW, None, None, None, self.__TARGET_COLOR, "dotted", None),
-                (self.DN_TARGET_HIGH, None, None, "20–40 DN target", self.__TARGET_COLOR, "dotted", None)]
+        # The target pair, built ONCE and handed to both consumers: the PROCESSING Reference-vs-Sample plot and
+        # the SAMPLE capture step's live preview. Dotted = the window a fill should land in. The dashed
+        # rejection edges are gone (see DN_TARGET_LOW above) — what the operator needs at the bench is "am I in
+        # the window?", and the edges were never reached.
+        return [(self.DN_TARGET_LOW, None, None, None, self.__TARGET_COLOR, "dotted", None),
+                (self.DN_TARGET_HIGH, None, None, "20–50 DN target (provisional)", self.__TARGET_COLOR,
+                 "dotted", None)]
+
+    def dnGuardColors(self):
+        return {"inside": self.__MEASURED_INSIDE_COLOR, "outside": self.__MEASURED_OUTSIDE_COLOR}
 
     # Hue-normalized colour chips: a fixed, CALM S/L so only HUE varies between oils (SPEC_capability_proof.md §5,
     # "C scheme" — Edwin 2026-07-22). Lowered from the original vivid 80/50 to a darker, less "popping" pair.
@@ -362,7 +390,7 @@ class DevSpectralPlugin(SpectralPlugin):
     # inside the existing bands are the same pixels — PB_R_Q and the gauge thresholds keep their meaning. But
     # the colour chips do NOT: EvaluationColorUtil integrates the whole curve, so the COLOUR row is not
     # comparable across a window change. The ratio metrics are.
-    WAVELENGTH_MIN_NM = 440.0
+    WAVELENGTH_MIN_NM = 400.0
     WAVELENGTH_MAX_NM = 636.0
 
     def evaluation(self, workflow):
@@ -879,11 +907,21 @@ class DevSpectralPlugin(SpectralPlugin):
         # reference is a solvent blank whose level is set by auto-exposure and judged against R ≈ 88. Drawing
         # 16/60 DN on the reference asserted a rule that does not apply there — and invited the operator to
         # "fix" a reference that was never wrong.
-        step.setView(CaptureView(prompt=prompt,
-                                 captureLabel="Capture " + label.lower(), geometry="transmission",
-                                 wavelengthMinNm=self.WAVELENGTH_MIN_NM, wavelengthMaxNm=self.WAVELENGTH_MAX_NM,
-                                 croppedPreview=True,  # Change A: cropped-ROI live preview (permanent, phase X)
-                                 levels=(self.dnLevels() if role == SAMPLE else [])))
+        # SPEC_capture_quality.md §16.23.10f: alongside the drawn target pair, the SAMPLE step declares WHERE
+        # the low-DN statistic is evaluated (`guardBandNm`), WHAT counts as acceptable (`guardTargetDn`) and
+        # HOW the measured reading is painted (`guardColors`). Declaring the target separately from `levels` is
+        # deliberate — `levels` is what gets DRAWN, `guardTargetDn` is the RULE, and both are built from the
+        # same two constants so they cannot drift.
+        captureView = CaptureView(prompt=prompt,
+                                  captureLabel="Capture " + label.lower(), geometry="transmission",
+                                  wavelengthMinNm=self.WAVELENGTH_MIN_NM, wavelengthMaxNm=self.WAVELENGTH_MAX_NM,
+                                  croppedPreview=True,  # Change A: cropped-ROI live preview (permanent, phase X)
+                                  levels=(self.dnLevels() if role == SAMPLE else []))
+        if role == SAMPLE:
+            captureView.setGuardBand(self.DN_GUARD_BAND[0], self.DN_GUARD_BAND[1],
+                                     targetDn=(self.DN_TARGET_LOW, self.DN_TARGET_HIGH),
+                                     colors=self.dnGuardColors())
+        step.setView(captureView)
         # M2 (SPEC_bench_pdf_export.md §5b): declare that this role's captured frame belongs in the PDF report
         # (cropped to the ROI). The plugin declares presence + flag; the HOST fills `.image` with the hardware
         # pixels after capture, embeds it as a named attachment, and draws it on the page. Alongside it, declare
