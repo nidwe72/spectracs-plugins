@@ -26,6 +26,8 @@ from sciens.spectracs.logic.spectral.synthesis.PlaygroundDemoOils import PLAYGRO
 
 from sciens.spectracs.plugins.dev.DevSpectralPlugin import DevSpectralPlugin
 from sciens.spectracs.plugins.dev.RoastGaugeView import RoastGaugeView
+from sciens.spectracs.plugins.dev.RoastPedestalGaugeView import RoastPedestalGaugeView
+from sciens.spectracs.plugins.dev.RoastQPercentGaugeView import RoastQPercentGaugeView
 
 # A fixed 3-anchor descending set for exercising GaugeColorUtil directly (NOT the plugin's actual roast anchors,
 # which start at 4.5 with an extra brown anchor — read those off the view in the view-model tests instead).
@@ -164,13 +166,44 @@ class DevPluginGaugeWiringTest(unittest.TestCase):
         self.assertIsInstance(badgeItems[0], VerdictGaugeView)
         self.assertEqual(badgeItems[0].render, GaugeRender.LABEL | GaugeRender.ZONES)
 
-    def test_badge_value_matches_the_evaluation_gauge(self):
+    def test_badge_value_matches_the_pedestal_gauge_and_deliberately_not_the_top_one(self):
+        # ⚠ CHANGED 2026-08-14 (SPEC_v_metric_integration.md §9). This used to assert that the LIMS badge
+        # carries the value of the FIRST evaluation gauge, which encoded §16.20's "the badge uses the same
+        # primary metric as the first EVALUATION gauge". `Q%` now takes the top slot on the bench — but the
+        # badge deliberately does NOT follow it, because `V` is one session old and has not met data it was
+        # not tuned on (ROADMAP PRIO 2c / σ_fill). The invariant is therefore restated, not dropped: the
+        # badge tracks the PEDESTAL gauge, wherever that now sits.
+        #
+        # ⛔ When σ_fill passes and the badge moves to `Q%`, this test is what has to change with it —
+        # deliberately, so the end-user verdict cannot switch metric by accident.
         workflow = self.__runPlugin()
-        evalGauge = self.__step(workflow, SpectralWorkflowPhaseType.EVALUATION, "Metrics") \
-            .getEvaluationResult().getItems()[0]
+        items = self.__step(workflow, SpectralWorkflowPhaseType.EVALUATION, "Metrics") \
+            .getEvaluationResult().getItems()
+        gauges = [item for item in items if isinstance(item, VerdictGaugeView)]
         badge = self.__step(workflow, SpectralWorkflowPhaseType.PUBLISHING, "Send to LIMS") \
             .getEvaluationResult().getItems()[0]
-        self.assertAlmostEqual(evalGauge.value, badge.value, places=9)
+        pedestal = [gauge for gauge in gauges if isinstance(gauge, RoastPedestalGaugeView)]
+        self.assertEqual(1, len(pedestal))
+        self.assertAlmostEqual(pedestal[0].value, badge.value, places=9)
+
+    def test_the_synthetic_oil_is_out_of_the_q_percent_domain_so_it_gets_no_pill(self):
+        # ⭐ §3.1a caught this fixture, and it is right to. The synthesized playground oil reads
+        # Q% ~= 48 — more than double the archive's browning end (12.70 .. 20.82 over 58 real runs) —
+        # so it is nothing like a real pumpkin-oil spectrum through this instrument. A gauge CLAMPS a
+        # value past its band, so without the domain guard this fixture would carry a confident
+        # "probably too brown" pill, and every reader would take it for a measurement.
+        # ⇒ the Q% gauge is ABSENT here, and the §16.20 ladder is untouched beneath it.
+        items = self.__step(self.__runPlugin(), SpectralWorkflowPhaseType.EVALUATION, "Metrics") \
+            .getEvaluationResult().getItems()
+        gauges = [item for item in items if isinstance(item, VerdictGaugeView)]
+        self.assertEqual([], [g for g in gauges if isinstance(g, RoastQPercentGaugeView)])
+        self.assertEqual(["RoastPedestalGaugeView", "RoastFar620GaugeView"],
+                         [type(g).__name__ for g in gauges])
+        # ⚠ ...but the NUMBER is still reported: only the verdict is withheld (§3.1a).
+        rows = [item.value for item in items
+                if type(item).__name__ == "MetricFieldView" and item.label == "Q%"]
+        self.assertEqual(1, len(rows))
+        self.assertNotEqual("—", rows[0])
 
 
 if __name__ == "__main__":

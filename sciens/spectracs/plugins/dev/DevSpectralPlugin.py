@@ -16,6 +16,7 @@ from sciens.spectracs.plugin_sdk import (
 # is how a wrong number gets quoted years later.
 from sciens.spectracs.plugins.dev.RoastPedestalGaugeView import RoastPedestalGaugeView
 from sciens.spectracs.plugins.dev.RoastFar620GaugeView import RoastFar620GaugeView
+from sciens.spectracs.plugins.dev.RoastQPercentGaugeView import RoastQPercentGaugeView
 
 
 class DevSpectralPlugin(SpectralPlugin):
@@ -219,6 +220,56 @@ class DevSpectralPlugin(SpectralPlugin):
     PB_SORET_BAND = (448.0, 460.0)    # Soret right-hand slope = green-pigment blue absorption
     PB_Q_BAND = (560.0, 580.0)        # green-pigment Q-band
 
+    # --- ⭐⭐ `V` / `Q%` — SPEC_metric_research.md §10, SPEC_v_metric_integration.md §3. -------------------
+    #
+    #   V  = (A_valley − A_Q) / A_Soret        Q% = −100·V = 100·(A_Q − A_valley)/A_Soret
+    #        on the DE-SPIKED RAW absorbance, ⛔ NO BASELINE ANYWHERE
+    #
+    # ⛔⛔ THESE ARE NOT THE PB WINDOWS AND MUST NOT BE ALIASED TO THEM. `V`'s Q band starts at 565, not the
+    # 560 of PB_Q_BAND, and its valley is 500–560, not GREEN_BAND's 510–540. §10.1's edge test found the Q
+    # window is the SENSITIVE one (572–578 destroys the separation outright). Reusing PB_Q_BAND here would
+    # render plausibly, disagree with `diagnostics/box_metrics.py`, and NOTHING WOULD ERROR —
+    # `tests/test_v_metric_windows.py` is what catches it.
+    #
+    # ⛔ FROZEN 2026-08-14 — pre-registration. Changing them invalidates ROADMAP PRIO 2c / σ_fill, which is
+    # the test of whether `V` survives data it was not tuned on. Do not re-tune.
+    #
+    # ⭐ WHY THIS CONSTRUCTION. The numerator is a DIFFERENCE, so any additive offset (stray light, scattering,
+    # seating) cancels — both bands carry it equally. The denominator is a LEVEL, so multiplicative scale
+    # (concentration, exposure) cancels. Same immunity the fitted chord provides, obtained arithmetically —
+    # and because nothing is fitted, NO ANCHOR CAN CONTAMINATE IT. That is not academic: §16.31.3a measures
+    # the shipped chord's far foot sitting ON the Qy band, giving every fill its own baseline slope.
+    V_SORET_BAND = (448.0, 460.0)     # same window as PB_SORET_BAND — deliberately declared separately
+    V_VALLEY_BAND = (500.0, 560.0)    # the rising flank between the bands (NOT a basin — §6.2)
+    V_Q_BAND = (565.0, 580.0)         # the Q band — ⛔ 565, not 560
+    # §10.3 — the shipped line, in V×100 with V's sign. ⭐ THE ONE SIGNED SOURCE: the gauge negates this to
+    # get its +18.6, so the two repositories cannot drift apart. Corridor midpoint is −18.665; −18.6 is kept
+    # on the STRICT side per §16.10.17d (a false GREEN is the harder error to make) and matches the one
+    # decimal displayed. No archived run lies between the two.
+    V_THRESHOLD = -18.6
+    # §3.1 — below this Soret level there is NO VERDICT AT ALL and no numbers either. The archive minimum is
+    # 0.334, so this only fires on a broken capture. ⚠ It withholds rather than clamps: a clamped pill is a
+    # lie with a number. ⭐ Verified on real data: it fires on all 27 runs of the 20260806A NULL SERIES.
+    V_SORET_FLOOR = 0.15
+    # §3.1a — the DOMAIN of the verdict, and a SECOND guard on the same withhold-don't-clamp principle.
+    # A gauge CLAMPS a value past its band edge (GaugeColorUtil, RD#5) — so without this, `Q%` = 39.90 draws
+    # a confident "probably too brown" and `Q%` = -28.34 draws "good — green", on samples the metric has no
+    # opinion about at all. ⛔ A NEGATIVE Q% means A_Q sits BELOW the valley: there is no Q band, so it is
+    # not an oil-shaped spectrum. Measured over the whole archive: 38 of 143 reports fall outside this band,
+    # 34 of them the loose pre-rebuild one-offs.
+    #
+    # ⚠ THE BAND, NOT THE SCORED CORRIDOR (12.70..20.82). Thirteen archived runs sit in between — e.g.
+    # 20260731A/004 at 20.94 and 20260808B/001 at 21.08 — and those ARE real brown-oil measurements a hair
+    # past the corpus. They keep their verdict. The band is the gauge's own declared scale; past it, the
+    # metric was never scored at all.
+    #
+    # ⭐ IT WITHHOLDS THE PILL ONLY — the numbers and the plot survive. Unlike a sub-floor Soret, an
+    # out-of-band Q% is a PERFECTLY GOOD MEASUREMENT of a sample outside the metric's domain: the band means
+    # are real, the bars sit where they belong, and blanking them would destroy evidence. It is the VERDICT
+    # that has no basis, and only the verdict is withheld.
+    # ⚠ Must equal RoastQPercentGaugeView's own band — `test_v_metric_windows` asserts it.
+    V_VERDICT_BAND = (12.0, 22.0)
+
     # --- SPEC_capture_quality.md §16.10.2/§16.10.9: the two anchor windows the linear baseline is fitted
     # through. A re-seating tilt enters absorbance as an offset AND a slope; fitting a straight line across
     # these two windows and subtracting it removes both, where a flat-offset subtraction removes only the
@@ -297,6 +348,10 @@ class DevSpectralPlugin(SpectralPlugin):
     # is what makes two overlaid curves safe: ownership is readable without a caption.
     __METRIC_BAR = __CORRECTED_COLOR  # ① Soret and ② Q — measured on the SUBTRACTED curve
     __ANCHOR_BAR = "#c9a227"          # ③ red and ④ quiet anchor — measured on the RAW curve
+    # SPEC_v_metric_integration.md §6.4 — CONSTRUCTION on the V tab (the crosshair and the zero datum), as
+    # distinct from a MEASURED bar. Cool against the warm gold/yellow so "this is a reference line, not a
+    # reading" survives at a glance. Both are drawn dashed for the same reason the fitted baseline is.
+    __V_CONSTRUCTION = "#8fb8d8"
 
     # --- SPEC_soret_448_trim.md §13 — THE DN GUARD, now plugin-owned data rather than a renderer constant.
     # §16.23.8 states it two-sided and this plugin is where the numbers belong: the guards are the REJECTION
@@ -446,8 +501,21 @@ class DevSpectralPlugin(SpectralPlugin):
         newPeak = SpectrumFeatureUtil().peakInRange(despikedAbsorption, *self.PB_Q_BAND)
         newQLambda = newPeak[0] if newPeak is not None else 570.0
         newSpectrumStep = SpectralWorkflowStep()
-        newSpectrumStep.setLabel("Absorption (bands)")   # §7b rename (was "Spectrum (new)" — the PB-band A(λ) plot)
+        # ⚠ RENAMED 2026-08-14 (SPEC_v_metric_integration.md §6): this tab was "Absorption (bands)" and the
+        # NAME now belongs to the V plot below. A saved run from before the cut-over therefore shows the CHORD
+        # picture under the new name — the plot TITLES differ ("A(λ) — PB bands" vs "A(λ) — V bands"), so the
+        # picture self-identifies even where the tab label does not. Same "compare verdicts, never numbers
+        # across a cut-over" rule §16 applies to the 448 trim.
+        newSpectrumStep.setLabel("Absorption (bands, baseline)")
         newSpectrumStep.setView(self.__bandPlot(despikedAbsorption, newQLambda))
+
+        # ⭐⭐ THE `V` PICTURE (SPEC_v_metric_integration.md §6) — one curve, no baseline, three bars, the
+        # valley crosshair and a zero datum, so the metric's numerator and denominator are both distances on
+        # screen. It is flagged into the PDF ADDITIVELY: the chord plot keeps its own flag and the report
+        # grows by a page rather than swapping one picture for another (Edwin).
+        vSpectrumStep = SpectralWorkflowStep()
+        vSpectrumStep.setLabel("Absorption (bands)")
+        vSpectrumStep.setView(self.__vBandPlot(despikedAbsorption))
 
         # M2 (SPEC_bench_pdf_export.md §1): declare a Report step. Its ReportView surfaces as a tab in EVALUATION
         # (beside Metrics | Spectrum) whose body the host renders with matplotlib (a preview that IS the PDF) +
@@ -461,9 +529,12 @@ class DevSpectralPlugin(SpectralPlugin):
                                       embedMetadata=True))
 
         # §7b step order: the NEW/PB-band views are primary; the legacy peak-ratio views become "(dev)".
-        # Metrics, Absorption (bands), Report, Metrics (dev), Absorption (bands, dev).
+        # ⚠ 2026-08-14 (SPEC_v_metric_integration.md §1): the V plot takes the "Absorption (bands)" name and
+        # the primary slot; the chord plot follows it as "(bands, baseline)". Newest-first, as with the rows.
+        # Metrics, Absorption (bands), Absorption (bands, baseline), Report, Metrics (dev), Absorption (dev).
         phase.addToSteps(newStep)          # "Metrics"
-        phase.addToSteps(newSpectrumStep)  # "Absorption (bands)"
+        phase.addToSteps(vSpectrumStep)    # "Absorption (bands)"        — the V picture
+        phase.addToSteps(newSpectrumStep)  # "Absorption (bands, baseline)" — the chord picture
         phase.addToSteps(reportStep)       # "Report"
         phase.addToSteps(metricsStep)      # "Metrics (dev)"
         phase.addToSteps(spectrumStep)     # "Absorption (bands, dev)"
@@ -499,6 +570,65 @@ class DevSpectralPlugin(SpectralPlugin):
                        "group": "Spectroscopy"}],
             backend="senaite", configKey="SENAITE"))
         phase.addToSteps(step)
+
+    def __vBandPlot(self, despikedAbsorption):
+        # SPEC_v_metric_integration.md §6 — the `V` picture. A DIFFERENT picture from __bandPlot, which is why
+        # it is a different tab: ONE curve, NO fitted baseline, NO subtracted curve, because `V` subtracts
+        # nothing. Everything it needs is already a view-model primitive.
+        #
+        # ⭐⭐ THE POINT: THE PICTURE IS THE ARITHMETIC. With the crosshair and the zero datum drawn, both
+        # halves of the formula are DISTANCES ON SCREEN —
+        #     the gap from ④ the valley crosshair up to ③ the Q bar  IS the NUMERATOR
+        #     the gap from ⑤ zero              up to ① the Soret bar IS the DENOMINATOR
+        # Same rule the chord tab was built on (SPEC_soret_448_trim.md §12.3/§25.1). ⛔ Without ⑤ the
+        # denominator has nothing to be measured against and the plot tells half the story.
+        #
+        # ⚠ ⑤ IS A RANGED BAR, NOT A FULL-WIDTH LINE, and that is deliberate. An unranged level renders as a
+        # pg.InfiniteLine on screen and ax.axhline on paper, and whether either participates in the view's
+        # AUTO-RANGE is not something this plot is willing to assume. A ranged level is a plain plot() call on
+        # both paths, so it is in-range by construction — and 448–460 is exactly where the denominator is
+        # read anyway. `tests/test_v_zero_datum_is_ranged.py` pins it.
+        #
+        # ⚠ NO λmax MARKER, unlike the chord tab. That tab marks it because D_Q measures a PEAK HEIGHT; `V`
+        # is window means only, and a peak marker would advertise a quantity this metric does not use.
+        util = SpectrumFeatureUtil()
+        view = SpectrumPlotView(title="A(λ) — V bands (despiked)")
+        view.setLegend(LegendPosition.NORTH_EAST, padding=34.0)
+        view.addTrace(despikedAbsorption, "A(λ) despiked", self.__RAW_COLOR)
+
+        # ⚠ The §3.1 guard: with no verdict there are no annotations either — every bar, the crosshair and the
+        # zero datum each assert a number we just declined to report. The bands stay: a WINDOW is a constant
+        # of the method, not a measurement.
+        vTerms = self.__vTerms(despikedAbsorption)
+        for band, caption in ((self.V_SORET_BAND, "S"), (self.V_VALLEY_BAND, "valley"),
+                              (self.V_Q_BAND, "Q")):
+            view.addBand(*band, caption)
+        if vTerms is None:
+            return view.setShownInReport(True)
+        soret, valley, qBand, _ = vTerms
+
+        # ⭐ GOLD, and that is a semantic choice: on the chord tab __ANCHOR_BAR means "measured on the RAW /
+        # despiked curve", which is exactly what all three of these are. Cyan (__METRIC_BAR) would have meant
+        # "measured on the subtracted curve" — and this tab HAS no subtracted curve, so it would have been a
+        # false statement two tabs apart. The colour keeps meaning one thing across both plots.
+        for number, band, label, mean in ((1, self.V_SORET_BAND, "Soret band mean", soret),
+                                          (2, self.V_VALLEY_BAND, "valley band mean", valley),
+                                          (3, self.V_Q_BAND, "Q band mean", qBand)):
+            view.addLevel(mean, band[0], band[1], label=label, color=self.__ANCHOR_BAR, number=number)
+
+        # ⭐ THE CROSSHAIR (§6.2). Horizontal arm at A_valley — exactly the number V uses — and the vertical
+        # arm at the λ where the curve ATTAINS it, so the cross-point sits ON the curve and both arms are
+        # true statements at once. Measured across 58 runs: 522.2 ± 1.5 nm.
+        # ⛔ NOT at the window's minimum: that sits at the LEFT edge (~509 nm) and is 23 % BELOW A_valley, so
+        # a cross drawn there would render fine and be silently false (§6.2).
+        view.addLevel(valley, label="valley level  A(λ) = A_valley", color=self.__V_CONSTRUCTION,
+                      style="dashed", number=4)
+        crossing = util.levelCrossing(despikedAbsorption, *self.V_VALLEY_BAND, valley)
+        if crossing is not None:
+            view.addMarker(crossing, "A_valley")
+        view.addLevel(0.0, self.V_SORET_BAND[0], self.V_SORET_BAND[1], label="zero",
+                      color=self.__V_CONSTRUCTION, style="dashed", number=5)
+        return view.setShownInReport(True)
 
     def __bandPlot(self, despikedAbsorption, qLambda):
         # SPEC_soret_448_trim.md §12.3/§12.4/§14 — the EVALUATION picture, declared entirely through the
@@ -714,8 +844,28 @@ class DevSpectralPlugin(SpectralPlugin):
         pedestalRatio = (None if far620Soret is None or far620Q is None
                          else far620Soret / max(far620Q - self.PB_R_Q, self.__EPS))
 
+        # ⭐⭐ `V` / `Q%` (SPEC_v_metric_integration.md §3). Computed on the SAME despiked curve, on its OWN
+        # frozen windows, with NO baseline. `__vTerms` returns None when the §3.1 guard trips — ONE condition,
+        # three consumers (no gauge, "—" rows, no annotations on the V plot).
+        vTerms = self.__vTerms(despikedAbsorption)
+        # ⚠ TWO guards, and they are not the same one (§3.1 / §3.1a). `vTerms` is None only when the
+        # measurement is broken; `hasVerdict` is False whenever the SAMPLE is outside the metric's domain,
+        # in which case the rows and the plot still report what was measured.
+        qPercent = vTerms[3] if self.__vHasVerdict(vTerms) else None
+
         dilutionInvariant = MetricFieldViewStyle.builder().labelBold(True).build()
         result = EvaluationResult()
+        # ⭐ `Q%` SITS ABOVE §16.20's LADDER — it is NOT a rung of it. The ladder's rungs differ from each
+        # other by HOW MUCH CORRECTION was applied (pedestal vs plain baseline), which is why each adjacent
+        # pair isolates exactly one change; those two stay adjacent below and that property is untouched.
+        # `Q%` is a DIFFERENT METRIC on a different construction — raw curve, no chord anywhere — so it heads
+        # the tab as the thing this project intends to ship, not as "one more step of correction".
+        # ⚠ ALL THREE RUN ON DIFFERENT SCALES: compare verdicts, never numbers.
+        # ⚠ And this one is ONE SESSION OLD (PRIO 2c / σ_fill is its out-of-sample test) — which is exactly
+        # why it is NOT wired to the PUBLISHING badge (SPEC_v_metric_integration.md §9).
+        if qPercent is not None:
+            result.addItem(RoastQPercentGaugeView(
+                qPercent, render=GaugeRender.BAND | GaugeRender.LABEL | GaugeRender.SWATCH))
         # SPEC_roast_ampel.md §8.5 — the Roast Ampel gauge is the FIRST item of this tab (gradient band + marker +
         # verdict pill + value-on-swatch), driven by the same Soret/Q pigment ratio the metric row below shows.
         pigmentRatio = ratio(soret, qBand)
@@ -739,6 +889,9 @@ class DevSpectralPlugin(SpectralPlugin):
         if colourChips:
             for chip in colourChips:
                 result.addItem(chip)
+        # ⭐ The `V` rows head the metric block (SPEC_v_metric_integration.md §5) — the eye lands on colour,
+        # then on the metric this project intends to ship, then on the older ladder below it.
+        self.__addVMetrics(result, vTerms)
         result.addItem(MetricFieldView("Soret · 448–460 nm", fmt(soret),
             "mean absorbance over the 448–460 nm Soret right-hand slope (green-pigment blue absorption). "
             "The window starts at 448, not 440: the 440–447 bins read 2.0–2.6 DN against a reference near 88 "
@@ -775,6 +928,70 @@ class DevSpectralPlugin(SpectralPlugin):
             "and 10.35 for the two gauges above), so no threshold separates them. Read the gauges, not this.",
             style=dilutionInvariant))
         return result
+
+    def __vTerms(self, despikedAbsorption):
+        """(A_Soret, A_valley, A_Q, Q%) on the de-spiked RAW absorbance — or None if there is no verdict.
+
+        SPEC_v_metric_integration.md §3. ⭐ ONE guard, evaluated ONCE and passed down, because it has three
+        consumers: the gauge, the metric rows and the V plot's annotations. Returning None rather than a
+        clamped value is the point — §3.1: a clamped pill is a lie with a number attached.
+        """
+        if despikedAbsorption is None:
+            return None
+        util = SpectrumFeatureUtil()
+        soret = util.bandMean(despikedAbsorption, *self.V_SORET_BAND)
+        valley = util.bandMean(despikedAbsorption, *self.V_VALLEY_BAND)
+        qBand = util.bandMean(despikedAbsorption, *self.V_Q_BAND)
+        if soret is None or valley is None or qBand is None or soret < self.V_SORET_FLOOR:
+            return None
+        return soret, valley, qBand, 100.0 * (qBand - valley) / soret
+
+    def __vHasVerdict(self, vTerms):
+        """Whether `Q%` may carry a VERDICT — §3.1a, the second guard.
+
+        ⚠ Deliberately separate from `__vTerms`. A sub-floor Soret means the MEASUREMENT is broken, so
+        nothing is reported. An out-of-band `Q%` means the measurement is fine and the SAMPLE is outside
+        this metric's domain — the numbers stay, the pill goes. Conflating the two would blank evidence.
+        """
+        if vTerms is None:
+            return False
+        low, high = self.V_VERDICT_BAND
+        return low <= vTerms[3] <= high
+
+    def __addVMetrics(self, result, vTerms):
+        # SPEC_v_metric_integration.md §5 — the FIVE `V` rows, at the head of the metric block.
+        soret, valley, qBand, qPercent = (None, None, None, None) if vTerms is None else vTerms
+        text = lambda value, digits: "—" if value is None else ("%.*f" % (digits, value))
+        dilutionInvariant = MetricFieldViewStyle.builder().labelBold(True).build()
+        # ⚠ ONE DECIMAL, and that is a measured choice: the within-fill sd of this quantity is 0.70 and the
+        # refill floor 0.21 (§10.5), so a second decimal would be theatre.
+        result.addItem(MetricFieldView("Q%", text(qPercent, 1),
+            "100 × (A_Q − A_valley) ÷ A_Soret on the DE-SPIKED RAW absorbance — the Q band's height above the "
+            "valley as a percentage of the Soret flank, with NO baseline anywhere. HIGHER = BROWNER; the line "
+            "is 18.6. ⭐ Best metric on record (class gap 5.05 σ vs M448's 3.80; separates under BOTH contested "
+            "labellings; 17/18 fills ordered right; a ±40 % dose change costs 0.12). ⛔ A LAMP SWAP moves it "
+            "4.84 — more than the whole green/brown span — so a chart cannot cross a lamp change; half "
+            "concentration moves it 2.19. ⚠ NOT yet tested on data it was not tuned on (PRIO 2c / σ_fill). "
+            "⛔ Outside 12–22 the value is still reported but NO VERDICT is drawn: the metric was never "
+            "scored there, and a negative Q% means there is no Q band above the valley at all.",
+            style=dilutionInvariant))
+        # ⚠ TWO decimals here, deliberately: this row's entire job is to be diffed against
+        # `diagnostics/box_metrics.py`, which prints two. It is the audit trail for the frozen definition.
+        result.addItem(MetricFieldView("V ×100 (frozen def.)", text(None if qPercent is None else -qPercent, 2),
+            "(A_valley − A_Q) ÷ A_Soret × 100 — the FROZEN form the spec, the diagnostics and PRIO 2c's "
+            "pre-registration all speak (SPEC_metric_research.md §10.1). Q% is exactly −1 × this. Shown so a "
+            "window silently drifting out of sync with the frozen definition is visible on screen."))
+        result.addItem(MetricFieldView("A_Soret · 448–460 nm", text(soret, 3),
+            "V's denominator: mean absorbance over the Soret flank on the de-spiked RAW curve. ⭐ It never "
+            "drops below 0.334 on the archive and never gets within 7.5 σ of zero — which is why V divides by "
+            "it and M448's B_Q (6 σ from zero) is the fragile one."))
+        result.addItem(MetricFieldView("A_valley · 500–560 nm", text(valley, 3),
+            "The window between the two bands. ⚠ NOT a basin: its minimum sits at the LEFT edge (~509 nm) and "
+            "the curve rises from there toward the Q band, so this is a slope average, 23 % above the true "
+            "minimum. ⛔ Which is why 'the valley is the pigment's own zero' does not hold — see W in §10.2."))
+        result.addItem(MetricFieldView("A_Q · 565–580 nm", text(qBand, 3),
+            "V's Q band. ⛔ 565, NOT the 560 of the 'Q · 560–580 nm' row below — these are different windows "
+            "and the edge test found this the sensitive one (572–578 destroys the separation)."))
 
     def __pairMetric(self, result, label, rawText, despikedText, tooltip, style=None):
         # A metric row plus its "· despiked" twin (median de-spiked absorbance), mirroring the colour-chip twin

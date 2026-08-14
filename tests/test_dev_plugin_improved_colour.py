@@ -109,6 +109,11 @@ class DevPluginImprovedColourTest(unittest.TestCase):
 
     # --- V3 (SPEC_capability_proof.md §2.1, Edwin 2026-07-22): the "Metrics" tab + second plot ---
 
+    # ⚠ RENAMED 2026-08-14 (SPEC_v_metric_integration.md §6): the chord picture these four cases assert
+    # about moved from "Absorption (bands)" to "Absorption (bands, baseline)", and the old NAME now belongs
+    # to the `V` plot — a different picture (one curve, no fitted baseline). Looking the step up by the old
+    # label would silently start asserting the chord tab's properties against the V tab.
+
     def __evalStep(self, workflow, label):
         phase = workflow.getPhase(SpectralWorkflowPhaseType.EVALUATION)
         return next((s for s in phase.getSteps().values() if s.getLabel() == label), None)
@@ -136,7 +141,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
         # one grey block at 510-540 was being read as the 520-540 anchor and was wrong by 10 nm (defect B2).
         # The clarity metric ROW is unaffected — asserted above.
         workflow = self.__runPlugin()
-        step = self.__evalStep(workflow, "Absorption (bands)")
+        step = self.__evalStep(workflow, "Absorption (bands, baseline)")
         self.assertIsNotNone(step, "the Spectrum (new) step")
         bands = step.getView().bands  # list of (lowNm, highNm, label, color)
         windows = {(round(b[0]), round(b[1])) for b in bands}
@@ -147,7 +152,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
         # SPEC_soret_448_trim.md §25.1 — three curves: the measurement, what the verdict reads, and the
         # construction that connects them (dashed, so it reads as construction).
         workflow = self.__runPlugin()
-        view = self.__evalStep(workflow, "Absorption (bands)").getView()
+        view = self.__evalStep(workflow, "Absorption (bands, baseline)").getView()
         labels = [trace[1] for trace in view.allTraces()]
         self.assertIn("A(λ) − baseline", labels)
         dashed = [trace for trace in view.allTraces() if trace[3] == "dashed"]
@@ -160,7 +165,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
         # Swap either source and nothing errors — the picture just stops being true.
         from sciens.spectracs.plugin_sdk import SpectrumFeatureUtil
         workflow = self.__runPlugin()
-        view = self.__evalStep(workflow, "Absorption (bands)").getView()
+        view = self.__evalStep(workflow, "Absorption (bands, baseline)").getView()
         util, plugin = SpectrumFeatureUtil(), DevSpectralPlugin()
         raw = view.allTraces()[0][0]   # the measured curve is a labelled TRACE now, not the primary
         corrected = util.linearBaselineCorrected(raw, plugin.PB_BASELINE_WINDOWS)
@@ -185,7 +190,7 @@ class DevPluginImprovedColourTest(unittest.TestCase):
     def test_the_band_plot_declares_a_numbered_legend_in_the_north_east(self):
         from sciens.spectracs.plugin_sdk import LegendPosition
         workflow = self.__runPlugin()
-        view = self.__evalStep(workflow, "Absorption (bands)").getView()
+        view = self.__evalStep(workflow, "Absorption (bands, baseline)").getView()
         self.assertEqual(view.legendPosition, LegendPosition.NORTH_EAST)
         self.assertGreater(view.legendPadding, 0, "a MAGNITUDE — the renderer owns the sign")
         rows = view.legendRows()
