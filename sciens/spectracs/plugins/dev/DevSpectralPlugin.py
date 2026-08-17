@@ -343,11 +343,11 @@ class DevSpectralPlugin(SpectralPlugin):
         return MonitorEngine(evaluator, FrameRing(policy.windowFrames, policy.retentionFrames), policy,
                              evaluatorId="dev-clearing", evaluatorVersion=evaluator.version)
 
-    def settlingStep(self, record):
-        """The Settling step-tab: the run's own history, from the run's own record (§18).
+    def settlingView(self, record):
+        """The Settling views: the run's own history, from the run's own record (§18).
 
-        ⛔ NO RECORD -> NO STEP. A plain-burst capture has no trajectory, and an empty graph is worse than
-        a missing tab — the same convention as "a hook that creates no steps is auto-skipped".
+        ⛔ NO RECORD -> NOTHING. A plain-burst capture has no trajectory, and an empty graph is worse
+        than a missing tab — the same convention as "a hook that creates no steps is auto-skipped".
 
         ⭐ Built from the GENERIC MonitorRecord (§15.2), so nothing here needs the host to understand
         `Q%`: the plugin knows its own column keys and hands over plain numbers under its own labels.
@@ -446,10 +446,10 @@ class DevSpectralPlugin(SpectralPlugin):
         if decisions is not None:
             group.addTab("Decisions", decisions)
 
-        step = SpectralWorkflowStep()
-        step.setLabel("Settling")
-        step.setView(group)
-        return step
+        # ⭐ A VIEW, NOT A STEP (§27.12). It is attached to the SAMPLE step's EvaluationResult by the host:
+        # ONE construction that the capture panel renders and the report collects, instead of the same
+        # record being built twice into two homes.
+        return group.setShownInReport(True)
 
     def __settlingSummary(self, record, answer):
         """The Overview tab: what was measured, how it was read, and under which rules — as TEXT.
@@ -610,18 +610,11 @@ class DevSpectralPlugin(SpectralPlugin):
         phase.addToSteps(self.__measurementStep(SAMPLE, "Sample", "Insert the oil dilution and capture"))
 
     def processing(self, workflow):
-        # ⭐ THE SETTLING STEP IS DECLARED HERE **REPORT-ONLY** (SPEC_settled_measurement.md §27.11). The
-        # operator reads it under Sample, where the measurement happened — ⛔ so no host draws a tab for
-        # it here. But the report is assembled from the WORKFLOW's flagged views, and a `Q%` that was
-        # CHOSEN deserves to carry the curve it was chosen from onto the paper.
-        # ⚠ Declared FIRST, before any measurement maths: a run that produced no value leaves the SAMPLE
-        # step uncaptured and the ops below return early — the diagnostic must survive the failure of the
-        # measurement it documents.
+        # ⭐ NOTHING ABOUT SETTLING IS DECLARED HERE (SPEC_settled_measurement.md §27.12). The settling
+        # views belong to the SAMPLE ACQUISITION step — they are provenance of THAT capture — so the host
+        # attaches them there when the monitored run finishes. The report harvests that step's
+        # EvaluationResult like any other, and files them under Acquisition, where they happened.
         phase = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
-        settling = self.settlingStep(
-            workflow.getMonitorRecord() if hasattr(workflow, "getMonitorRecord") else None)
-        if settling is not None:
-            phase.addToSteps(settling.setReportOnly(True))
 
         acquisition = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
         captured = SpectraContainer()
