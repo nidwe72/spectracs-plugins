@@ -1,7 +1,7 @@
 from sciens.spectracs.plugin_sdk import (
     SpectralPlugin, SpectralWorkflowPhaseType, SpectralWorkflowStep, SpectraContainer,
     MeanOp, TransmissionOp, AbsorptionOp, BaselineOffsetOp, MedianFilterOp,
-    SpectrumPlotView, CaptureView, SpectrumCaptureView, TabGroupView, ReportView,
+    SpectrumPlotView, CaptureView, SpectrumCaptureView, TabGroupView, ReportView, SeriesPlotView, TableView,
     LimsPublishView, GaugeRender,
     EvaluationResult, LabelView, MetricFieldView, MetricFieldViewStyle, SpectrumFeatureUtil,
     EvaluationColorUtil, MetadataField,
@@ -14,9 +14,256 @@ from sciens.spectracs.plugin_sdk import (
 # tests build them, and RoastBaselineGaugeView still documents the 600-630 scale — but nothing renders them,
 # and their thresholds were deliberately NOT re-derived for the 448 window: maintaining a scale nobody reads
 # is how a wrong number gets quoted years later.
+import numpy
+
+from sciens.spectracs.plugin_sdk import (
+    FrameRing, MonitorEngine, MonitorPolicy, MonitorDecision, MonitorOutcome, MonitorMode,
+)
 from sciens.spectracs.plugins.dev.RoastPedestalGaugeView import RoastPedestalGaugeView
 from sciens.spectracs.plugins.dev.RoastFar620GaugeView import RoastFar620GaugeView
 from sciens.spectracs.plugins.dev.RoastQPercentGaugeView import RoastQPercentGaugeView
+
+
+class ClearingEvaluator:
+    """The settling algorithm of SPEC_settled_measurement.md §14 — the PLUGIN's own, not the SDK's.
+
+    ⛔⛔ IT LIVES IN THIS FILE ON PURPOSE (§21/M1). `PluginPublishUtil.lintSelfContained()` rejects a
+    plugin source that imports app or sibling code, so a published plugin is ONE module. A plain class
+    beside the plugin class is fine (the "more than one plugin class" check only counts SpectralPlugin
+    subclasses); a sibling module would make the plugin unpublishable.
+
+    ⭐ COMPOSED, NOT INHERITED (§10.1a-bis): this object is handed to a `MonitorEngine` the plugin
+    assembles. The engine owns the ring, the reduce, the centre stamp, the promotion and the caps; this
+    class owns what any of it MEANS. It knows the bands; the engine never will.
+    """
+
+    version = "clearing-1.0"
+    valueKey = "qPercent"
+
+    # ⭐ Every constant here is the PLUGIN's. None of them appear in the SDK (§10.2).
+    THETA_PER_MINUTE = 0.0017      # §14.3 — §2.1's "0.005 per 3-minute sample", re-expressed as a RATE
+    # ⭐⭐ THE COMPARISON SPAN IS IN SECONDS, NOT IN WINDOWS — and that correction came from replaying the
+    # real 2026-08-14 curve (§14.2b/§14.3 rule 3). "j = 2 windows" is only the right answer when a window
+    # is ~35 s long: on the archive's 3.3-minute samples the same j doubles a span that was already
+    # correct, and the gate fires two samples late. What the noise budget actually asks for is a span of
+    # ~70 s or more, so the evaluator walks back to the first decision row at least this far away and
+    # works identically at any cadence, on live frames and on a replayed CSV alike.
+    GATE_SPAN_SECONDS = 70.0
+    GATE_CONSECUTIVE = 2           # k_gate — two consecutive flat comparisons (TEST A)
+    TREND_ROWS = 5                 # m — the re-clouding trend baseline (TEST B)
+    MATERIAL_FALL = 0.010          # how far A_valley must have fallen BELOW ITS MAXIMUM to call it "was clearing"
+
+    def __init__(self, plugin, reference, mode=None):
+        self.__plugin = plugin
+        self.__reference = reference
+        self.mode = mode or MonitorMode.PRODUCT
+        # ⚠ `plugin` is only needed by evaluate() (the metric). decide() is pure arithmetic over rows, so
+        # a test may drive the ALGORITHM with no plugin, no camera and no spectra — which is exactly what
+        # §11.9b's "replay the 2026-08-14 CSV rows" does.
+        self.columns = list(plugin.MONITOR_COLUMNS) if plugin is not None else []
+        self.__consecutiveFlat = 0
+        self.__gateIndex = None        # index into the decision rows where the gate fired
+        self.__branch = None
+        self.__reclouded = False
+
+    # --- the two questions the engine asks --------------------------------------------------------
+
+    def evaluate(self, spectrum):
+        container = SpectraContainer()
+        container.addToSpectra(self.__reference, REFERENCE)
+        container.addToSpectra(spectrum, SAMPLE)
+        return self.__plugin.monitorMetrics(container)     # ⭐ the plugin's OWN public metric (§10.3)
+
+    def decide(self, rows):
+        decisions = [row for row in rows if row.isDecisionRow and not row.provisional]
+        if not decisions:
+            return MonitorDecision.carryOn()
+        latest = decisions[-1]
+
+        # ⛔ §3.1 / §12.3: below the Soret floor the MEASUREMENT is broken — abort at once rather than
+        # burning 25 minutes of lamp on a fill that cannot produce a number.
+        if not latest.values:
+            if len(decisions) >= 2 and not any(row.values for row in decisions[-2:]):
+                return MonitorDecision(stop=True, outcome=MonitorOutcome.MEASUREMENT_BROKEN,
+                                       note="A_Soret below the floor — no numbers at all (§3.1)")
+            return MonitorDecision.carryOn()
+
+        # Already read? A DIAGNOSTIC run keeps observing (§11.9c) — the engine's latch (§14.6) is what
+        # makes that safe, so there is nothing more to decide here.
+        if self.__gateIndex is not None:
+            return self.__afterGate(decisions)
+
+        note = None
+        if self.__isReclouding(decisions):
+            # ⭐ TEST B (§14.5): a SUSTAINED SIGNED trend, on a LONG baseline where noise averages down.
+            # A rise resets the counter AND the clearing clock — the jar cooled below its cloud point on
+            # the way in, which is a diagnosable condition, not a glitch.
+            self.__consecutiveFlat = 0
+            self.__reclouded = True
+            note = "re-clouding — the gate was reset (§14.5 TEST B)"
+        elif self.__isFlat(decisions):
+            # ⭐ TEST A (§14.5): flatness is a MAGNITUDE question on a SHORT baseline. ⛔ The first draft
+            # asked one comparison to answer both questions, and on an already-clear fill (true rate 0,
+            # measured rate zero-mean noise) a signed test rejected half of all comparisons at random.
+            self.__consecutiveFlat += 1
+        else:
+            self.__consecutiveFlat = 0
+
+        if self.__consecutiveFlat >= self.GATE_CONSECUTIVE and self.__hasFallenSinceMaximum(decisions):
+            return self.__fireGate(decisions)
+        return MonitorDecision.carryOn(note)
+
+    # --- the gate ---------------------------------------------------------------------------------
+
+    @classmethod
+    def rateAt(cls, times, values, index):
+        """d(A_valley)/dt in per-MINUTE units, across NON-OVERLAPPING windows ≥ GATE_SPAN_SECONDS apart.
+
+        ⭐ §14.3 rules 1+3. Walking back by TIME rather than by a window count is what makes the criterion
+        cadence-independent: the threshold is a rate, so the only thing that must be held is the span it
+        is measured over — long enough for the noise budget of §14.2b, and never shorter.
+
+        ⭐ PUBLIC AND SHARED: the gate decides with it AND the Settling plot draws with it, so the picture
+        and the decision cannot disagree. A plot that showed a differently-computed rate would be a
+        diagnostic that lies about the thing it is diagnosing."""
+        for older in range(index - 1, -1, -1):
+            minutes = (times[index] - times[older]) / 60.0
+            if minutes <= 0:
+                return None                 # ⚠ a non-monotonic clock (§25/X3) — refuse rather than invent
+            if times[index] - times[older] >= cls.GATE_SPAN_SECONDS:
+                if values[index] is None or values[older] is None:
+                    return None
+                return (values[index] - values[older]) / minutes
+        return None                         # not enough history yet to measure a rate at all
+
+    @classmethod
+    def ratesOver(cls, times, values):
+        return [cls.rateAt(times, values, index) for index in range(len(times))]
+
+    def __rate(self, decisions, index):
+        return self.rateAt([row.t for row in decisions],
+                           [row.get("valley") for row in decisions], index)
+
+    def __isFlat(self, decisions):
+        rate = self.__rate(decisions, len(decisions) - 1)
+        return rate is not None and abs(rate) < self.THETA_PER_MINUTE
+
+    def __isReclouding(self, decisions):
+        window = [row for row in decisions[-self.TREND_ROWS:] if row.values]
+        if len(window) < self.TREND_ROWS:
+            return False
+        times = [row.t / 60.0 for row in window]
+        values = [row.get("valley") for row in window]
+        slope, standardError = self.__slopeWithError(times, values)
+        if slope is None:
+            return False
+        return slope > self.THETA_PER_MINUTE and slope > 2.0 * standardError
+
+    def __hasFallenSinceMaximum(self, decisions):
+        # ⚠ §14.5: never settle at the TOP of a re-clouding dip. A fill that is flat from the first row
+        # satisfies this trivially (its maximum IS the first row and no fall is required).
+        valleys = [row.get("valley") for row in decisions if row.values]
+        if len(valleys) < 2:
+            return True
+        maximumIndex = valleys.index(max(valleys))
+        return maximumIndex < len(valleys) - 1
+
+    def __fireGate(self, decisions):
+        self.__gateIndex = len(decisions) - 1
+        valleys = [row.get("valley") for row in decisions if row.values]
+        fall = max(valleys) - decisions[-1].get("valley")
+        # ⭐ §9.6: ONE algorithm — what the gate SAW picks the read, not what the operator claims.
+        if fall >= self.MATERIAL_FALL:
+            self.__branch = "was-clearing"
+            # The vertex needs the row AFTER the gate as well, so the read waits exactly one more
+            # decision row (§14.4) — never the ten further minutes a rise-confirmation would cost.
+            return MonitorDecision.carryOn("gate fired (was clearing) — waiting one row for the vertex")
+        self.__branch = "arrived-clear"
+        return MonitorDecision(promote=True, stop=self.mode == MonitorMode.PRODUCT,
+                               outcome=MonitorOutcome.SETTLED_IMMEDIATE, branch=self.__branch,
+                               readAs="FIRST_SETTLED_WINDOW", note="settled — the fill arrived clear")
+
+    def __afterGate(self, decisions):
+        if self.__branch != "was-clearing":
+            return MonitorDecision.carryOn()
+        # ⭐ The vertex is read around the Q% MINIMUM, not around the gate row (§2.2: "the minimum, read as
+        # a parabola vertex through its three neighbours"). Those are different rows — on the 2026-08-14
+        # curve the minimum sits at t = 16.7 while the gate confirms it at 19.9 — and fitting around the
+        # gate row instead would fit a rising ramp, whose parabola has no minimum at all.
+        usable = [row for row in decisions if row.values]
+        if len(usable) < 3:
+            return MonitorDecision.carryOn()
+        minimumIndex = min(range(len(usable)), key=lambda index: usable[index].get("qPercent"))
+        if minimumIndex == len(usable) - 1:
+            # The minimum is still the newest row: it may yet fall further, so wait for its right-hand
+            # neighbour rather than declaring a minimum that has no other side.
+            return MonitorDecision.carryOn()
+        window = usable[max(0, minimumIndex - 1):minimumIndex + 2]
+        vertex = self.__vertex(window)
+        return MonitorDecision(promote=True, stop=self.mode == MonitorMode.PRODUCT,
+                               outcome=MonitorOutcome.SETTLED_AFTER_CLEARING, branch=self.__branch,
+                               readAs="VERTEX", answer=vertex, promoteRow=usable[minimumIndex],
+                               note="settled — read as a parabola vertex")
+
+    def __vertex(self, window):
+        """The Q% minimum as a PARABOLA VERTEX through three decision rows (§2.2).
+
+        ⚠ The minimum of n noisy samples is biased LOW by ~0.9 sd because it SELECTS the most negative
+        excursion; a vertex through three points AVERAGES instead. ⚠ Guards carried over from the
+        prototype (§25/X8): fewer than three usable points, or an upward-opening fit that is not a
+        minimum, fall back to the raw row — and np.polyfit RAISES on identical x rather than returning nan.
+        """
+        usable = [row for row in window if row.values]
+        if len(usable) < 3:
+            return window[-1].get("qPercent")
+        times = [row.t for row in usable]
+        values = [row.get("qPercent") for row in usable]
+        if len(set(times)) < 3:
+            return usable[-1].get("qPercent")
+        try:
+            a, b, c = numpy.polyfit(times, values, 2)
+        except Exception:
+            return usable[-1].get("qPercent")
+        if not numpy.isfinite(a) or a <= 0:
+            return usable[-1].get("qPercent")
+        at = -b / (2 * a)
+        return float(a * at * at + b * at + c)
+
+    @staticmethod
+    def __slopeWithError(times, values):
+        n = len(times)
+        meanT = sum(times) / n
+        meanV = sum(values) / n
+        denominator = sum((t - meanT) ** 2 for t in times)
+        if denominator <= 0:
+            return None, None
+        slope = sum((t - meanT) * (v - meanV) for t, v in zip(times, values)) / denominator
+        intercept = meanV - slope * meanT
+        residuals = [v - (slope * t + intercept) for t, v in zip(times, values)]
+        if n <= 2:
+            return slope, 0.0
+        variance = sum(residual ** 2 for residual in residuals) / (n - 2)
+        return slope, (variance / denominator) ** 0.5
+
+    # --- what the operator sees (§13.3) -----------------------------------------------------------
+
+    def coach(self, rows):
+        decisions = [row for row in rows if row.isDecisionRow and row.values]
+        if not decisions:
+            return {"state": "starting …", "progress": ("INDETERMINATE", None), "fields": []}
+        latest = decisions[-1]
+        rate = self.__rate(decisions, len(decisions) - 1)
+        # ⛔ §17/U1: NO provisional Q% is shown. A number displayed while it is still moving is a number
+        # somebody writes down — and the settled value may differ by more than the gauge's own boundaries.
+        fields = [("turbidity", "%.4f%s" % (latest.get("valley"),
+                                            "" if rate is None else "  %+.4f/min" % rate))]
+        if self.__reclouded and self.__gateIndex is None:
+            return {"state": "re-clouded — warming again …", "progress": ("INDETERMINATE", None),
+                    "fields": fields, "severity": "WARN"}
+        if self.__gateIndex is not None:
+            fields.append(("Q%", "%.1f" % latest.get("qPercent")))
+            return {"state": "settled — measuring", "progress": ("INDETERMINATE", None), "fields": fields}
+        return {"state": "clearing …", "progress": ("INDETERMINATE", None), "fields": fields}
 
 
 class DevSpectralPlugin(SpectralPlugin):
@@ -70,6 +317,282 @@ class DevSpectralPlugin(SpectralPlugin):
         return WorkflowPolicy(navigation=NavigationPolicy(
             NavigationMode.AUTO_ADVANCE, stepChevronPhases={SpectralWorkflowPhaseType.ACQUISITION}))
 
+    # --- monitored acquisition (SPEC_settled_measurement.md §10.1a-bis) --------------------------------
+
+    MONITOR_WINDOW_FRAMES = 50     # ⭐ W. §14.2b: bigger is always better at fixed wall-clock, so W_gate = W
+    MONITOR_RETENTION_FRAMES = 60  # R = W + margin. ⛔ NOT sized by the run length — the winner is promoted out
+    MONITOR_MAX_SECONDS = 1500.0   # 25 min (§12.2), chosen against the 17-min beam-clearing of 2026-08-14
+
+    def createMonitor(self, reference=None, mode=None, frames=None):
+        """ASSEMBLE the monitor: an SDK engine + an SDK ring + ⭐ THIS PLUGIN'S OWN evaluator.
+
+        ⭐⭐ COMPOSITION, NOT INHERITANCE (§10.1a-bis). Nothing calls INTO this plugin during a run: the
+        host is handed one object and only pushes frames into it. The engine holds a collaborator it was
+        given — it does not know the word "plugin", and it names no wavelength.
+
+        ⚠ `reference` is the already-captured blank, held FIXED for the whole run: every row is
+        `S_window` against that one `R`. Without it there is nothing to compute absorbance against, so a
+        missing reference means no monitor (the host then falls back to a plain burst).
+        """
+        if reference is None:
+            return None
+        policy = MonitorPolicy(windowFrames=frames or self.MONITOR_WINDOW_FRAMES,
+                               retentionFrames=self.MONITOR_RETENTION_FRAMES,
+                               maxSeconds=self.MONITOR_MAX_SECONDS)
+        evaluator = ClearingEvaluator(self, reference, mode)
+        return MonitorEngine(evaluator, FrameRing(policy.windowFrames, policy.retentionFrames), policy,
+                             evaluatorId="dev-clearing", evaluatorVersion=evaluator.version)
+
+    def settlingStep(self, record):
+        """The Settling step-tab: the run's own history, from the run's own record (§18).
+
+        ⛔ NO RECORD -> NO STEP. A plain-burst capture has no trajectory, and an empty graph is worse than
+        a missing tab — the same convention as "a hook that creates no steps is auto-skipped".
+
+        ⭐ Built from the GENERIC MonitorRecord (§15.2), so nothing here needs the host to understand
+        `Q%`: the plugin knows its own column keys and hands over plain numbers under its own labels.
+        ⚠ Two panels, ⛔ never one shared y-axis: `Q%` sits near 13 while `A_valley` runs 0.95 -> 0.026,
+        and the gate panel is LOG because a 40x fall puts the settling tail — the part being judged — in
+        the bottom 3 % of a linear panel (§18.7).
+        """
+        rows = (record or {}).get("rows") or []
+        if not rows:
+            return None
+        answer = record.get("answer") or {}
+        minutes = [row["t"] / 60.0 for row in rows]
+
+        view = SeriesPlotView(title="Settling", xLabel="minutes since insertion")
+        outcome = record.get("outcome", "")
+        view.addHeaderField("outcome", outcome)
+        if answer.get("value") is not None:
+            view.addHeaderField("Q%", "%.2f" % answer["value"])
+            view.addHeaderField("read", "%s · %s" % (answer.get("readAs", "?"), answer.get("branch", "?")))
+            view.addHeaderField("at", "%.2f min" % (answer["t"] / 60.0))
+            low, high = self.V_VERDICT_BAND
+            # ⛔ §18.7: the 12-22 domain is a HEADER CHIP, not an axis level — drawn as levels it forces a
+            # 10-unit axis around a 0.5-unit trajectory and flattens the trace into a line.
+            view.addHeaderField("domain", "✓ in domain" if low <= answer["value"] <= high
+                                else "⛔ outside %g–%g — no verdict" % (low, high))
+        if record.get("clearingSeconds") is not None:
+            view.addHeaderField("clearing", "%.2f min" % (record["clearingSeconds"] / 60.0))
+
+        view.addPanel("qPercent", "Q%", scale="linear")
+        view.addSeries("qPercent", minutes, [row.get("qPercent") for row in rows], "Q%", "#e08000")
+        if answer.get("value") is not None:
+            view.addPoint("qPercent", answer["t"] / 60.0, answer["value"], "the answer", "#2ECC71")
+
+        # ⛔⛔ THE θ LINE DOES NOT BELONG ON THIS PANEL, and putting it there was a CATEGORY ERROR (rig
+        # screenshot, 2026-08-17): θ = 0.0017 is a RATE, in absorbance per MINUTE; this panel's y-axis is
+        # ABSORBANCE. Drawing it at y = 0.0017 asserts an equivalence that does not exist — and it forced
+        # the axis to span from 0.0017 up past the data, which is what made the panel unreadable.
+        # ⇒ ⭐ the criterion gets its OWN panel, in its own units, where the convergence is actually visible.
+        valleys = [row.get("valley") for row in rows]
+        view.addPanel("valley", "A_valley 500–560 nm", scale=self.__panelScale(valleys))
+        view.addSeries("valley", minutes, valleys, "A_valley", "#4aa3df")
+
+        # ⭐ THE GATE PANEL PROPER: |d A_valley / dt| against θ — the one plot on which "has it settled?"
+        # can be read directly. Computed with the SAME ≥70 s span rule the evaluator gates on (§14.3), so
+        # the picture and the decision cannot disagree.
+        rates = ClearingEvaluator.ratesOver([row["t"] for row in rows], valleys)
+        rateMinutes = [minute for minute, rate in zip(minutes, rates) if rate is not None]
+        rateValues = [abs(rate) for rate in rates if rate is not None]
+        if rateValues:
+            view.addPanel("rate", "|Δ A_valley / Δt|  (the gate)", scale=self.__panelScale(rateValues))
+            view.addSeries("rate", rateMinutes, rateValues, "rate", "#c8a05a")
+            view.addLevel("rate", ClearingEvaluator.THETA_PER_MINUTE,
+                          "settled below %g /min" % ClearingEvaluator.THETA_PER_MINUTE)
+
+        for panelKey in ("valley", "rate"):
+            if not any(panel["key"] == panelKey for panel in view.panels):
+                continue
+            if record.get("clearingSeconds") is not None:
+                view.addMarker(panelKey, record["clearingSeconds"] / 60.0, "gate fired")
+            for note in record.get("notes") or []:
+                if "re-clouding" in note:
+                    view.addMarker(panelKey, float(note.split("s ")[0]) / 60.0, "re-clouded")
+
+        # ⭐ §18.7: the footer is what makes a saved run re-analysable in a year. A graph without it is a
+        # picture, not a record.
+        policy = record.get("policy") or {}
+        view.addFooterField("policy", "W %s · cadence %s · cap %.0f s"
+                            % (policy.get("windowFrames"), policy.get("evaluateEveryNFrames"),
+                               policy.get("maxSeconds", 0)))
+        view.addFooterField("evaluator", "%s %s" % (record.get("evaluatorId"), record.get("evaluatorVersion")))
+        if record.get("distinctFraction") is not None:
+            view.addFooterField("distinct frames", "%.1f %%" % (100.0 * record["distinctFraction"]))
+
+        # ⭐⭐ OVERVIEW IS A SUMMARY, NOT A CHART (Edwin, at the rig 2026-08-17 — this REVERSES §18.8's
+        # "the first tab must answer alone with both curves"). Three stacked panels in a fixed-height step
+        # left every one of them short, and the numbers that actually answer "what did I measure and why
+        # can I trust it" are TEXT. ⇒ Overview carries the answer, the read, the guards and the audit
+        # line as an aligned metric grid; every curve gets its own full-height tab beside it.
+        # ⚠ The cost is stated where it was argued: correlating the gate with the Q% trace now takes two
+        # tabs. Edwin has seen both and chosen this.
+        group = TabGroupView().addTab("Overview", self.__settlingSummary(record, answer))
+
+        # ⭐ ONE TAB PER GRAPH, at full height. ⚠ shownInReport stays FALSE on them: tabs flatten to
+        # sections on paper (§18.8), and the report takes the summary, not three separate pages.
+        for panel in view.panels:
+            single = SeriesPlotView(title=panel["label"], xLabel=view.xLabel)
+            single.panels = [panel]                    # the SAME panel dict — one construction, two homes
+            group.addTab(self.__SETTLING_TAB_LABELS.get(panel["key"], panel["key"]), single)
+
+        health = self.__settlingHealthTable(record)
+        if health is not None:
+            # ⭐ Conditional, and entirely plugin-side: the tab appears only when it has something to say,
+            # so a miller's PDF never carries a page of empty diagnostics (§18.8).
+            group.addTab("Health", health)
+        decisions = self.__settlingDecisionsTable(record)
+        if decisions is not None:
+            group.addTab("Decisions", decisions)
+
+        step = SpectralWorkflowStep()
+        step.setLabel("Settling")
+        step.setView(group)
+        return step
+
+    def __settlingSummary(self, record, answer):
+        """The Overview tab: what was measured, how it was read, and under which rules — as TEXT.
+
+        ⭐ Rendered through the ordinary metric grid (`MetricFieldView`), so it lines up exactly like the
+        EVALUATION rows the operator already reads, with tooltips carrying the why. ⛔ No chart here: the
+        curves have their own tabs, at a height where they can be read.
+        """
+        items = [LabelView("Settling — how this measurement was chosen")]
+        outcome = record.get("outcome", "?")
+        items.append(MetricFieldView(
+            "Outcome", outcome,
+            "SETTLED_IMMEDIATE = the fill arrived clear · SETTLED_AFTER_CLEARING = it cleared in the beam "
+            "and the Q% minimum was read as a parabola vertex · NEVER_SETTLED / CANCELLED / "
+            "MEASUREMENT_BROKEN = ⛔ no value at all, and the curve tabs show why.",
+            style=MetricFieldViewStyle.builder().labelBold(True).build()))
+
+        if answer.get("value") is not None:
+            low, high = self.V_VERDICT_BAND
+            inDomain = low <= answer["value"] <= high
+            items.append(MetricFieldView(
+                "Q%", "%.2f" % answer["value"],
+                "The answer. LATCHED at the moment it was read — later rows join the trajectory but can "
+                "never replace it, or a noise dip late in the photodamage ramp would steal the value.",
+                style=MetricFieldViewStyle.builder().labelBold(True).build()))
+            items.append(MetricFieldView(
+                "Verdict domain", "✓ inside %g–%g" % (low, high) if inDomain
+                else "⛔ outside %g–%g — value stands, NO verdict" % (low, high),
+                "§3.1a: outside this band the metric was never scored, so the number is reported but no "
+                "verdict is drawn."))
+            items.append(MetricFieldView(
+                "Read as", "%s · %s" % (answer.get("readAs", "?"), answer.get("branch", "?")),
+                "FIRST_SETTLED_WINDOW = the fill was flat from the start, so the first settled window IS "
+                "the answer. VERTEX = it was clearing, so the Q% minimum was read as a parabola through "
+                "its three neighbours — the raw minimum of noisy samples is biased low."))
+            items.append(MetricFieldView("Read at", "%.2f min" % (answer["t"] / 60.0),
+                                         "Time of the winning window's CENTRE, measured from the first frame."))
+        else:
+            items.append(MetricFieldView(
+                "Value", "— none —",
+                "⛔ A run without a value never reports one. The curve tabs show how far it got; a fill "
+                "that has been in the beam has also banked light dose, so a FRESH fill reads truer than "
+                "re-measuring this one."))
+
+        if record.get("clearingSeconds") is not None:
+            items.append(MetricFieldView(
+                "Clearing time", "%.2f min" % (record["clearingSeconds"] / 60.0),
+                "When the gate confirmed the fill had stopped clearing. ⭐ Logged with every measurement "
+                "because it is a σ_fill component, not a diagnostic curiosity."))
+        rows = record.get("rows") or []
+        if rows:
+            items.append(MetricFieldView("Decision rows", "%d" % len(rows),
+                                         "Windows the gate was actually evaluated on."))
+            accepted = [row.get("nAccepted") for row in rows if row.get("nAccepted") is not None]
+            if accepted:
+                items.append(MetricFieldView(
+                    "Frames accepted", "%d–%d of %s" % (min(accepted), max(accepted),
+                                                        (record.get("policy") or {}).get("windowFrames", "?")),
+                    "⚠ A dip WHILE THE FILL CLEARS is expected, not a fault: the C1 frame rejection was "
+                    "built for an auto-exposure ramp, and inside a rolling window a clearing sample looks "
+                    "like one."))
+        for note in record.get("notes") or []:
+            items.append(MetricFieldView("Note", note, "Events the evaluator recorded during the run."))
+
+        # ⭐ The audit line — without it a saved run is a picture, not a record (§18.7).
+        policy = record.get("policy") or {}
+        items.append(MetricFieldView(
+            "Policy", "W %s · cadence %s · cap %.0f s" % (policy.get("windowFrames"),
+                                                          policy.get("evaluateEveryNFrames"),
+                                                          policy.get("maxSeconds", 0)),
+            "The rules this run was made under. ⛔ Two runs made under different rules must never be "
+            "compared silently."))
+        items.append(MetricFieldView("Evaluator", "%s %s" % (record.get("evaluatorId"),
+                                                             record.get("evaluatorVersion")),
+                                     "Which algorithm, and which version of it, produced the answer."))
+        if record.get("distinctFraction") is not None:
+            items.append(MetricFieldView(
+                "Distinct frames", "%.1f %%" % (100.0 * record["distinctFraction"]),
+                "Fraction of camera frames that were NOT a repeat of their predecessor. Duplicates "
+                "inflate the noise (a window of W behaves like W × this), so a run whose duplicate rate "
+                "drifted is a run whose noise budget drifted with it."))
+        for item in items:
+            item.setShownInReport(True)
+        return items
+
+    # Short tab labels for the per-graph tabs — the panel labels themselves carry units and are too long
+    # for a tab bar that already holds Overview / Health / Decisions.
+    __SETTLING_TAB_LABELS = {"qPercent": "Q%", "valley": "Turbidity", "rate": "Rate"}
+
+    @staticmethod
+    def __panelScale(values):
+        """log ONLY when the data actually spans a decade (rig screenshot, 2026-08-17).
+
+        ⛔ A log axis on a nearly FLAT series is worse than useless: pyqtgraph fills the axis with minor
+        decade ticks (0.01 · 0.02 · 0.03 · 0.04 · 0.06 …) that overlap into an unreadable smear, around a
+        line that never moves. ⭐ Log earns its place on a CLEARING curve (A_valley falls 40×, and on a
+        linear axis the settling tail the gate judges would sit in the bottom 3 %) — and nowhere else."""
+        usable = [value for value in values if value is not None and value > 0]
+        if len(usable) < 2:
+            return "linear"
+        return "log" if (max(usable) / min(usable)) >= 10.0 else "linear"
+
+    def __settlingHealthTable(self, record):
+        """`A_Soret`, DN and `nAccepted` per row — ⭐ shown ONLY when one of them says something.
+
+        ⚠ `nAccepted` DIPPING DURING FAST CLEARING IS CORRECT, not a fault (§23/V2): C1 was built to
+        reject the coherent dim group an auto-exposure ramp leaves behind, and inside a rolling window
+        during clearing that "ramp" is the measurement. ⇒ the caption says so, rather than leaving a
+        reader to read a real dip as a broken capture."""
+        rows = record.get("rows") or []
+        window = record.get("policy", {}).get("windowFrames")
+        dipped = any(row.get("nAccepted") is not None and window and row["nAccepted"] < window for row in rows)
+        lowSoret = any(row.get("soret") is not None and row["soret"] < self.V_SORET_FLOOR * 1.5 for row in rows)
+        if not (dipped or lowSoret):
+            return None
+        table = (TableView(title="Capture health",
+                           caption="⚠ nAccepted dipping while the fill clears is EXPECTED: the C1 frame "
+                                   "rejection was built for an auto-exposure ramp, and inside a rolling "
+                                   "window a clearing sample looks like one. It is not a fault.")
+                 .addColumn("t", "t", "s", "%.1f").addColumn("soret", "A_Soret", None, "%.4f")
+                 .addColumn("n", "frames", None, "%d").addColumn("nAccepted", "accepted", None, "%d"))
+        for row in rows:
+            table.addRow(row)
+        return table
+
+    def __settlingDecisionsTable(self, record):
+        """The numeric decision rows — ⚠ DIAGNOSTIC content, so it is withheld from short product runs.
+
+        ⭐ It answers "why exactly THERE?" numerically, which the plots can only answer approximately."""
+        rows = [row for row in (record.get("rows") or []) if row.get("isDecisionRow", True)]
+        # ⚠ Relaxed from 8 to 2 after the rig (2026-08-17): a settled 1.7-minute run has ~3 decision rows,
+        # and on the MASTER bench three rows of "here is exactly what the gate compared" is precisely what
+        # the operator wants to see. Two is the floor because one row is not a trajectory.
+        if len(rows) < 2:
+            return None
+        table = (TableView(title="Decision rows",
+                           caption="Every row the gate was evaluated on (§14.4).")
+                 .addColumn("t", "t", "s", "%.1f").addColumn("valley", "A_valley", None, "%.4f")
+                 .addColumn("qPercent", "Q%", None, "%.3f").addColumn("nAccepted", "accepted", None, "%d"))
+        for row in rows:
+            table.addRow(row)
+        return table
+
     def metadata(self, workflow):
         # Change C — the METADATA form, taken over from PumpkinOilPlugin. The user lands here after measuring
         # (the auto-advance jump halts on the required form), then Next -> PUBLISHING.
@@ -87,6 +610,15 @@ class DevSpectralPlugin(SpectralPlugin):
         phase.addToSteps(self.__measurementStep(SAMPLE, "Sample", "Insert the oil dilution and capture"))
 
     def processing(self, workflow):
+        # ⛔ THE SETTLING STEP IS **NOT** DECLARED HERE (Edwin, at the rig 2026-08-17). It lives where the
+        # operator reads it — as an inner tab of the SAMPLE capture step, built by `settlingStep()` and
+        # placed by the host. Declaring it in PROCESSING as well put the same curves in two places.
+        # ⚠ CONSEQUENCE, RECORDED RATHER THAN HIDDEN: the report is assembled from the WORKFLOW's flagged
+        # views, so with no step here the settling summary and curves do NOT reach the PDF. The record
+        # itself still persists on the workflow (§15.2), so nothing is lost — but §18's "it also enters
+        # the PDF" is not currently true, and re-enabling it means declaring a step somewhere again.
+        phase = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
+
         acquisition = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
         captured = SpectraContainer()
         for step in acquisition.getSteps().values():
@@ -94,12 +626,16 @@ class DevSpectralPlugin(SpectralPlugin):
             if role is None or step.getContainer() is None:
                 continue
             captured.addToSpectra(step.getContainer().getSpectra()[role], role)
+        if REFERENCE not in captured.getSpectra() or SAMPLE not in captured.getSpectra():
+            # ⛔ A monitored run that produced no value deliberately leaves the step uncaptured (§12.1:
+            # "a cancelled capture is not a capture"). Return with ONLY the settling tab rather than
+            # raising a KeyError three ops down — the operator gets the curve that explains it.
+            return
 
         meaned = MeanOp().apply(captured)              # {reference: mean, sample: mean}
         transmission = TransmissionOp().apply(meaned)  # {transmission}
         absorption = AbsorptionOp().apply(meaned)      # {absorption}
 
-        phase = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
         phase.setHint("You can view the measurement results here.")  # SPEC_acquisition_guidance: plugin-authored
 
         # Change G (SPEC_simplified_plugin_navigation.md §4.7-G): the Reference/Sample RASTER inspection views are
@@ -929,12 +1465,48 @@ class DevSpectralPlugin(SpectralPlugin):
             style=dilutionInvariant))
         return result
 
+    # --- the PUBLIC metric API (SPEC_settled_measurement.md §10.3) -------------------------------------
+
+    MONITOR_COLUMNS = [
+        {"key": "qPercent", "label": "Q%", "unit": ""},
+        {"key": "soret", "label": "A_Soret 448-460", "unit": "A"},
+        {"key": "valley", "label": "A_valley 500-560", "unit": "A"},
+        {"key": "qBand", "label": "A_Q 565-580", "unit": "A"},
+    ]
+
+    def monitorMetrics(self, container):
+        """{REFERENCE, SAMPLE} -> {"qPercent", "soret", "valley", "qBand"} — or {} below the §3.1 floor.
+
+        ⭐⭐ THE DRY KEYSTONE (SPEC_settled_measurement.md §10.3). `diagnostics/clearing_time_course.py`
+        used to reach in through NAME MANGLING (`plugin._DevSpectralPlugin__vTerms(...)`) because there was
+        no API — the DRY instinct fighting the absence of one. This is that API.
+
+        ⚠ NOTE WHO CALLS IT, because it is the whole point of §10.1a-bis: this plugin's OWN evaluator
+        calls it, and a diagnostic script may call it directly. ⛔ The SDK never does — it does not know
+        the method exists. The plugin is not asked for `Q%` by the machinery; it computes `Q%` for itself,
+        inside an object it built, and emits a row the machinery merely carries.
+
+        ⚠ Returns {} rather than raising when the Soret floor is not met: the caller's row legitimately
+        carries no values at all (§25/X3), and a clamped number would be a lie with a number attached.
+        """
+        absorption = AbsorptionOp().apply(container).getSpectra().get(ABSORPTION)
+        terms = self.__vTerms(self.__despikedAbsorption(absorption))
+        if terms is None:
+            return {}
+        soret, valley, qBand, qPercent = terms
+        return {"qPercent": qPercent, "soret": soret, "valley": valley, "qBand": qBand}
+
     def __vTerms(self, despikedAbsorption):
         """(A_Soret, A_valley, A_Q, Q%) on the de-spiked RAW absorbance — or None if there is no verdict.
 
         SPEC_v_metric_integration.md §3. ⭐ ONE guard, evaluated ONCE and passed down, because it has three
         consumers: the gauge, the metric rows and the V plot's annotations. Returning None rather than a
         clamped value is the point — §3.1: a clamped pill is a lie with a number attached.
+
+        ⚠ This stays the internal form (it returns a TUPLE, which the three consumers unpack); the public
+        `monitorMetrics()` above is the named-dict face of the SAME computation. ⛔ There is exactly ONE
+        definition of the metric and it is here — a second copy "for a while" is the §10.1a failure in
+        miniature (SPEC_settled_measurement.md §21/M4).
         """
         if despikedAbsorption is None:
             return None
