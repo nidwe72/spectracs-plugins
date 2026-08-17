@@ -41,7 +41,20 @@ class ClearingEvaluator:
     valueKey = "qPercent"
 
     # ⭐ Every constant here is the PLUGIN's. None of them appear in the SDK (§10.2).
-    THETA_PER_MINUTE = 0.0017      # §14.3 — §2.1's "0.005 per 3-minute sample", re-expressed as a RATE
+    # ⭐ θ = 0.005 /min (Edwin, 2026-08-18 — §27.26/M2). It was 0.0017: §2.1's "0.005 per 3-minute sample"
+    # re-expressed as a RATE, i.e. 4.4σ of the rate noise (§14.2b).
+    # ⭐⭐ RAISING IT COSTS NOTHING AND SAVES DOSE, measured by replaying jar B (2026-08-14, the one archived
+    # fill that actually cleared): at 0.0017 the gate promotes at 23.21 min, at anything ≥ 0.0025 it
+    # promotes at 19.93 — **3.3 minutes less lamp on the sample** — and the value read is BIT-IDENTICAL,
+    # 13.2733, in every case.
+    # ⭐ Why it is free: θ decides only WHEN TO STOP LOOKING. The answer is protected by the VERTEX read,
+    # which is fitted around the `Q%` minimum wherever that sits — so a gate that fires earlier reads the
+    # same minimum, it just stops wasting light confirming it.
+    # ⚠ The gain SATURATES at 0.0025 (0.004, 0.006 and 0.010 all promote at the same row), so 0.005 sits
+    # mid-plateau rather than at its edge. ⛔ It is a choice with margin, NOT a derived optimum: one curve,
+    # sampled at 3.28 min. ⚠ A larger θ risks firing while a fill is still clearing — not noise-tripping,
+    # which is what the 4.4σ derivation guarded against.
+    THETA_PER_MINUTE = 0.005       # §14.3 as a RATE; raised from 0.0017 on the jar-B replay (§27.26/M2)
     # ⭐⭐ THE COMPARISON SPAN IS IN SECONDS, NOT IN WINDOWS — and that correction came from replaying the
     # real 2026-08-14 curve (§14.2b/§14.3 rule 3). "j = 2 windows" is only the right answer when a window
     # is ~35 s long: on the archive's 3.3-minute samples the same j doubles a span that was already
