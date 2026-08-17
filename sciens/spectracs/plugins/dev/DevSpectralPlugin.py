@@ -430,12 +430,23 @@ class DevSpectralPlugin(SpectralPlugin):
         # tabs. Edwin has seen both and chosen this.
         group = TabGroupView().addTab("Overview", self.__settlingSummary(record, answer))
 
-        # ⭐ ONE TAB PER GRAPH, at full height. ⚠ shownInReport stays FALSE on them: tabs flatten to
-        # sections on paper (§18.8), and the report takes the summary, not three separate pages.
+        # ⭐ ONE TAB PER GRAPH, at full height — ⭐⭐ AND ALL THREE GO ON PAPER (Edwin, 2026-08-17, after
+        # reading the first report: "I want all 3 graphs to be rendered in the report").
+        #
+        # ⛔ THIS REVERSES §27.8's `shownInReport = False`, AND THAT FLAG HAD OUTLIVED ITS REASON. It was set
+        # because Overview was then the COMBINED chart, so flagging the per-graph tabs would have printed the
+        # same three curves twice — once combined, once one per page. §27.9 turned Overview into a TEXT
+        # summary with no chart, which deleted the duplication and with it the argument, but the flags stayed
+        # ⇒ the PDF carried no curve at all, and §18.6 ("a Q% that carries its own settling curve is a
+        # different object from a bare number — it shows the reader that the value was CHOSEN, when, and on
+        # what evidence") was false again, in a new way.
+        # ⚠ The TABLES stay off paper (Health / Decisions, below): §18.8's "a miller's report never carries a
+        # page of empty diagnostics" is about the 34-row decision arithmetic, not about the curves.
         for panel in view.panels:
             single = SeriesPlotView(title=panel["label"], xLabel=view.xLabel)
             single.panels = [panel]                    # the SAME panel dict — one construction, two homes
-            group.addTab(self.__SETTLING_TAB_LABELS.get(panel["key"], panel["key"]), single)
+            group.addTab(self.__SETTLING_TAB_LABELS.get(panel["key"], panel["key"]),
+                         single.setShownInReport(True))
 
         health = self.__settlingHealthTable(record)
         if health is not None:
