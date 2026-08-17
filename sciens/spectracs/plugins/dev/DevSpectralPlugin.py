@@ -610,14 +610,18 @@ class DevSpectralPlugin(SpectralPlugin):
         phase.addToSteps(self.__measurementStep(SAMPLE, "Sample", "Insert the oil dilution and capture"))
 
     def processing(self, workflow):
-        # ⛔ THE SETTLING STEP IS **NOT** DECLARED HERE (Edwin, at the rig 2026-08-17). It lives where the
-        # operator reads it — as an inner tab of the SAMPLE capture step, built by `settlingStep()` and
-        # placed by the host. Declaring it in PROCESSING as well put the same curves in two places.
-        # ⚠ CONSEQUENCE, RECORDED RATHER THAN HIDDEN: the report is assembled from the WORKFLOW's flagged
-        # views, so with no step here the settling summary and curves do NOT reach the PDF. The record
-        # itself still persists on the workflow (§15.2), so nothing is lost — but §18's "it also enters
-        # the PDF" is not currently true, and re-enabling it means declaring a step somewhere again.
+        # ⭐ THE SETTLING STEP IS DECLARED HERE **REPORT-ONLY** (SPEC_settled_measurement.md §27.11). The
+        # operator reads it under Sample, where the measurement happened — ⛔ so no host draws a tab for
+        # it here. But the report is assembled from the WORKFLOW's flagged views, and a `Q%` that was
+        # CHOSEN deserves to carry the curve it was chosen from onto the paper.
+        # ⚠ Declared FIRST, before any measurement maths: a run that produced no value leaves the SAMPLE
+        # step uncaptured and the ops below return early — the diagnostic must survive the failure of the
+        # measurement it documents.
         phase = workflow.getPhase(SpectralWorkflowPhaseType.PROCESSING)
+        settling = self.settlingStep(
+            workflow.getMonitorRecord() if hasattr(workflow, "getMonitorRecord") else None)
+        if settling is not None:
+            phase.addToSteps(settling.setReportOnly(True))
 
         acquisition = workflow.getPhase(SpectralWorkflowPhaseType.ACQUISITION)
         captured = SpectraContainer()
