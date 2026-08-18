@@ -37,7 +37,11 @@ class ClearingEvaluator:
     class owns what any of it MEANS. It knows the bands; the engine never will.
     """
 
-    version = "clearing-1.0"
+    # ⭐ §29.6/§30.12: the READ RULE's version, stamped into every record as `evaluatorVersion`. 1.0 read
+    # the look at which the gate finished confirming; 2.0 reads the first look unless the curve turned.
+    # ⛔ It changes what four of the seven series F runs would report ⇒ any recomputation of archived
+    # numbers must be able to say which rule produced them, and this is how it says so.
+    version = "clearing-2.0"
     valueKey = "qPercent"
 
     # ⭐ Every constant here is the PLUGIN's. None of them appear in the SDK (§10.2).
@@ -64,9 +68,26 @@ class ClearingEvaluator:
     GATE_SPAN_SECONDS = 70.0
     GATE_CONSECUTIVE = 2           # k_gate — two consecutive flat comparisons (TEST A)
     TREND_ROWS = 5                 # m — the re-clouding trend baseline (TEST B)
-    MATERIAL_FALL = 0.010          # how far A_valley must have fallen BELOW ITS MAXIMUM to call it "was clearing"
 
-    def __init__(self, plugin, reference, mode=None):
+    # ⛔⛔ `MATERIAL_FALL = 0.010` WAS DELETED HERE (§30.1). It asked "has A_valley fallen far enough to
+    # call this fill 'was clearing'?" — i.e. it took the decision about HOW TO READ Q% from a DIFFERENT
+    # QUANTITY. §29.2 moved that decision onto the curve being read, so the constant has no reader left,
+    # and a turbidity threshold left sitting in a class whose read no longer consults turbidity is exactly
+    # the trap this file's opening comment describes about the two retired gauges.
+
+    # ⭐⭐ THE DEPTH DISCRIMINATOR (§29.2 / §30.3-30.6). How far below its FIRST look does the Q% minimum
+    # sit? Two clusters with a 15x gap on series F — 0.000 · 0.000 · 0.000 · 0.010 against 0.149 · 0.279 ·
+    # 7.233 — and the threshold falls inside it, DERIVED rather than chosen.
+    # ⛔⛔ IT IS NOT A NUMBER, IT IS A FUNCTION OF W (§30.4). `W` is whatever the operator picked in the
+    # Frames combo (10 / 20 / 50 / the plugin's 60) — `CapturePanel.__monitorFor()` passes it straight
+    # through — so a pasted 0.126 would be a constant derived at one setting and used at another, which is
+    # the §27.25 bug in a new costume. It is derived in __init__ from the window actually in force.
+    SINGLE_WINDOW_SIGMA = 0.063    # sd of Q% over 10 repeats, jar UNTOUCHED (SPEC_capture_quality §16.36.6)
+    SIGMA_REFERENCE_FRAMES = 60    # ...measured at W = 60, which is the ONLY window it was ever measured at
+    DEPTH_SIGMA_MULTIPLE = 2.0     # 2σ. ⚠ §29.6: the min of n noisy looks sits ~0.9σ low at n=7 by chance
+                                   # alone and ~1.5σ at n=20, so 1σ would promote noise to a vertex.
+
+    def __init__(self, plugin, reference, mode=None, windowFrames=None):
         self.__plugin = plugin
         self.__reference = reference
         self.mode = mode or MonitorMode.PRODUCT
@@ -74,10 +95,41 @@ class ClearingEvaluator:
         # a test may drive the ALGORITHM with no plugin, no camera and no spectra — which is exactly what
         # §11.9b's "replay the 2026-08-14 CSV rows" does.
         self.columns = list(plugin.MONITOR_COLUMNS) if plugin is not None else []
+        # ⭐ §30.4/R1.1: the evaluator is HANDED the window it is judging. It defaults to the window the
+        # noise was measured at, so a caller that forgets says "60" rather than silently meaning something
+        # else — ⚠ and `test_clearing_evaluator` passes it explicitly, because a test whose threshold
+        # follows a default is a test that stops being about the threshold.
+        self.windowFrames = int(windowFrames or self.SIGMA_REFERENCE_FRAMES)
+        self.depthThreshold = self.depthThresholdFor(self.windowFrames)
         self.__consecutiveFlat = 0
         self.__gateIndex = None        # index into the decision rows where the gate fired
         self.__branch = None
         self.__reclouded = False
+        # ⭐ §30.8: TEST B does not merely reset the GATE, it invalidates the HISTORY. Everything before a
+        # re-clouding event belongs to a fill that was cloudier than the one now being measured, so the
+        # minimum hunt — and "the first look" with it — starts again from there.
+        self.__huntFrom = 0
+
+    @classmethod
+    def depthThresholdFor(cls, windowFrames):
+        """2σ of ONE window's Q%, in the units the depth is measured in (§30.5).
+
+        ⭐ Window noise falls as 1/√W, so a smaller window wants a larger threshold.
+        ⛔⛔ BUT IT IS CLAMPED AT ITS W = 60 VALUE, AND THE CLAMP IS THE LOAD-BEARING HALF (§30.15, Edwin's
+        decision): 0.063 is the spread of WHOLE CAPTURES, so it already contains lamp and auto-exposure
+        drift that does NOT average down with more frames. Scaling it up for a small window therefore
+        OVER-states the noise, which raises the threshold, which pushes runs onto the "arrived clear"
+        branch — and that is the expensive error by ~100x: +7.233 on run 006, +12.783 on jar B, against
+        the ~0.01 a false vertex costs (005's own noise minimum sits 0.010 from its first look).
+        ⚠ The residual is stated, not hidden: at W = 10 the clamp is SAFE but not HONEST — the threshold is
+        then tighter than the true window noise, so a flat noisy curve will sometimes take the vertex
+        branch. One decision row and hundredths of a unit; the cheap side, deliberately.
+        """
+        frames = max(1, int(windowFrames or cls.SIGMA_REFERENCE_FRAMES))
+        scaled = cls.DEPTH_SIGMA_MULTIPLE * cls.SINGLE_WINDOW_SIGMA * \
+            (float(cls.SIGMA_REFERENCE_FRAMES) / frames) ** 0.5
+        atReference = cls.DEPTH_SIGMA_MULTIPLE * cls.SINGLE_WINDOW_SIGMA
+        return min(scaled, atReference)
 
     # --- the two questions the engine asks --------------------------------------------------------
 
@@ -101,10 +153,14 @@ class ClearingEvaluator:
                                        note="A_Soret below the floor — no numbers at all (§3.1)")
             return MonitorDecision.carryOn()
 
-        # Already read? A DIAGNOSTIC run keeps observing (§11.9c) — the engine's latch (§14.6) is what
-        # makes that safe, so there is nothing more to decide here.
+        # ⭐⭐ ONE READ, ASKED REPEATEDLY (§30.1). Once the gate has fired the question is always the same
+        # one — "what does the Q% curve look like?" — so the gate row and every row after it go through
+        # the SAME method. ⛔ The old shape decided the branch inside __fireGate from a turbidity fall and
+        # promoted there and then, which is why the clear branch could never be re-examined.
+        # ⚠ A DIAGNOSTIC run keeps observing after promotion (§11.9c); the engine's latch (§14.6) is what
+        # makes calling this again harmless.
         if self.__gateIndex is not None:
-            return self.__afterGate(decisions)
+            return self.__read(decisions)
 
         note = None
         if self.__isReclouding(decisions):
@@ -113,7 +169,12 @@ class ClearingEvaluator:
             # the way in, which is a diagnosable condition, not a glitch.
             self.__consecutiveFlat = 0
             self.__reclouded = True
-            note = "re-clouding — the gate was reset (§14.5 TEST B)"
+            # ⭐⭐ §30.8: AND IT RESETS THE HUNT WINDOW. Everything before this row belongs to a cloudier
+            # fill than the one now in the beam, so leaving it in the span would let "the first look" be
+            # taken from the most turbid moment of the run — the exact value the algorithm exists to avoid
+            # reporting. ⚠ Reasoned, not measured: none of the seven series F runs re-clouded.
+            self.__huntFrom = len(decisions) - 1
+            note = "re-clouding — the gate and the hunt window were reset (§14.5 TEST B, §30.8)"
         elif self.__isFlat(decisions):
             # ⭐ TEST A (§14.5): flatness is a MAGNITUDE question on a SHORT baseline. ⛔ The first draft
             # asked one comparison to answer both questions, and on an already-clear fill (true rate 0,
@@ -182,41 +243,134 @@ class ClearingEvaluator:
         return maximumIndex < len(valleys) - 1
 
     def __fireGate(self, decisions):
-        self.__gateIndex = len(decisions) - 1
-        valleys = [row.get("valley") for row in decisions if row.values]
-        fall = max(valleys) - decisions[-1].get("valley")
-        # ⭐ §9.6: ONE algorithm — what the gate SAW picks the read, not what the operator claims.
-        if fall >= self.MATERIAL_FALL:
-            self.__branch = "was-clearing"
-            # The vertex needs the row AFTER the gate as well, so the read waits exactly one more
-            # decision row (§14.4) — never the ten further minutes a rise-confirmation would cost.
-            return MonitorDecision.carryOn("gate fired (was clearing) — waiting one row for the vertex")
-        self.__branch = "arrived-clear"
-        return MonitorDecision(promote=True, stop=self.mode == MonitorMode.PRODUCT,
-                               outcome=MonitorOutcome.SETTLED_IMMEDIATE, branch=self.__branch,
-                               readAs="FIRST_SETTLED_WINDOW", note="settled — the fill arrived clear")
+        """The gate does ONE job now: it stops the looking (§30.1).
 
-    def __afterGate(self, decisions):
-        if self.__branch != "was-clearing":
+        ⛔ It used to pick the branch as well, from how far `A_valley` had fallen — i.e. it decided how to
+        read `Q%` by looking at a DIFFERENT QUANTITY, and promoted immediately on the clear side. That is
+        the defect of §29.1: `FIRST_SETTLED_WINDOW` reported the look at which confirmation FINISHED,
+        while the lamp had been bleaching the sample throughout it (+0.482 on run 003).
+        ⭐ Turbidity now answers only "when to stop looking"; the shape of the curve being read answers
+        "what to report"."""
+        self.__gateIndex = len(decisions) - 1
+        # ⛔⛔ THE VERTEX BRANCH STILL WAITS ONE ROW AT THE GATE (§14.4) — AND THE ARCHIVE IS WHY.
+        # The first cut of §30 read at the gate row on BOTH branches, which looked like free dose. Replaying
+        # run 006 refuted it: its gate fires at 279.5 s, and at that instant the deepest look so far is
+        # 262.6 s with a row already on its far side — a legitimate-looking interior minimum. The TRUE
+        # minimum arrives at 296.8 s, 0.012 lower. ⇒ reading at the gate settles on a local dip while the
+        # fill is still descending. §29.3 and §30.14 both say the vertex read is UNCHANGED; it was not.
+        # ⭐ The clear branch is different in kind and reads immediately: its answer is the FIRST look, and
+        # no amount of further waiting can improve a row that has already been captured — waiting there
+        # would buy nothing and cost lamp, which is the whole point of §29.
+        if self.__depthOf(decisions)[0] >= self.depthThreshold:
+            return MonitorDecision.carryOn(
+                "gate fired (was clearing) — waiting one row for the vertex")
+        decision = self.__read(decisions)
+        # ⭐ THE GATE ALWAYS ANNOUNCES ITSELF, even when the same row also reads (§30.1). Under the old
+        # shape the gate row could only ever say "gate fired"; now it may gate AND read in one step, and a
+        # run whose record never mentions the gate would leave `clearingSeconds` unexplained — and the
+        # acceptance test of §14.3 identifies the gate row by exactly this phrase.
+        decision.note = "gate fired — %s" % (decision.note or "carrying on")
+        return decision
+
+    # --- the read (§29.3, ordered per §30.3) ------------------------------------------------------
+
+    def __read(self, decisions):
+        """How far below its FIRST look does the `Q%` minimum sit? — asked at the gate row and at every
+        decision row after it, until it answers.
+
+        ⭐⭐ DEPTH FIRST, AND THE ORDER IS LOAD-BEARING (§30.3). §29.3 listed the interior test first; read
+        that way, a SHALLOW minimum that happens to sit on the newest row also waits — and if noise keeps
+        putting it there the run waits to the 25-minute cap and finishes with NO VALUE, where today's clear
+        branch always answers. Asking the depth first makes the wait reachable only for a curve that has
+        earned it, and saves a decision row of lamp on every flat fill.
+
+            depth <  2σ(W)                       ->  the FIRST look          ⭐ the fix
+            depth >= 2σ(W) and argmin INTERIOR   ->  the VERTEX              (unchanged)
+            depth >= 2σ(W) and argmin is LAST    ->  wait one more row       (unchanged)
+
+        ⚠ THE SPAN IS THE WHOLE RUN, not the post-gate rows (§30.2): 004's minimum sits 34 s BEFORE its
+        gate fired and 007's 17 s before, and jar B's sits 3.3 minutes before. Only a re-clouding event
+        moves the start (§30.8).
+        ⛔ NOT A FIT, and this was tested (§29.3): a monotone rise has no turning point, and extrapolating
+        one back to the first look's time gives 13.710 on run 003 — BELOW the measured 13.764, because the
+        browning ACCELERATES. And the winner must be a REAL look in any case: its spectrum feeds the colour
+        chips, the band plots and every recomputed PDF metric, and there is no such thing as a fitted
+        spectrum (§9.1a)."""
+        depth, usable, minimumIndex = self.__depthOf(decisions)
+        if not usable:
             return MonitorDecision.carryOn()
+        first = usable[0]
+
+        if depth < self.depthThreshold:
+            # ⭐ No turning point deeper than this window's own noise ⇒ nothing has happened since the
+            # first look but photodamage, so the first look IS the least-damaged measurement of the run.
+            self.__branch = "arrived-clear"
+            return MonitorDecision(
+                promote=True, stop=self.mode == MonitorMode.PRODUCT,
+                outcome=MonitorOutcome.SETTLED_IMMEDIATE, branch=self.__branch,
+                readAs="FIRST_SETTLED_WINDOW", promoteRow=first,
+                diagnostics=self.__readDiagnostics(usable, first, depth),
+                note="settled — no turning point deeper than %.3f, so the FIRST look is the answer"
+                     % self.depthThreshold)
+
+        if minimumIndex == len(usable) - 1:
+            # The minimum is still the newest row: it may yet fall further, so wait for its right-hand
+            # neighbour rather than declaring a minimum that has no other side. ⚠ This is also what keeps
+            # §27.26a's early gate harmless — at θ = 0.005 jar B's gate fires at 13.38 min while its own
+            # minimum is at 16.66, and the read simply refuses until the far side exists.
+            return MonitorDecision.carryOn("gate fired (still clearing) — the minimum is still the newest "
+                                           "look, waiting for its far side")
+
         # ⭐ The vertex is read around the Q% MINIMUM, not around the gate row (§2.2: "the minimum, read as
         # a parabola vertex through its three neighbours"). Those are different rows — on the 2026-08-14
         # curve the minimum sits at t = 16.7 while the gate confirms it at 19.9 — and fitting around the
         # gate row instead would fit a rising ramp, whose parabola has no minimum at all.
-        usable = [row for row in decisions if row.values]
         if len(usable) < 3:
             return MonitorDecision.carryOn()
-        minimumIndex = min(range(len(usable)), key=lambda index: usable[index].get("qPercent"))
-        if minimumIndex == len(usable) - 1:
-            # The minimum is still the newest row: it may yet fall further, so wait for its right-hand
-            # neighbour rather than declaring a minimum that has no other side.
-            return MonitorDecision.carryOn()
+        self.__branch = "was-clearing"
+        winner = usable[minimumIndex]
         window = usable[max(0, minimumIndex - 1):minimumIndex + 2]
-        vertex = self.__vertex(window)
         return MonitorDecision(promote=True, stop=self.mode == MonitorMode.PRODUCT,
                                outcome=MonitorOutcome.SETTLED_AFTER_CLEARING, branch=self.__branch,
-                               readAs="VERTEX", answer=vertex, promoteRow=usable[minimumIndex],
+                               readAs="VERTEX", answer=self.__vertex(window), promoteRow=winner,
+                               diagnostics=self.__readDiagnostics(usable, winner, depth),
                                note="settled — read as a parabola vertex")
+
+    def __depthOf(self, decisions):
+        """How far below its FIRST look the `Q%` minimum sits — ⭐ ONE computation, two callers.
+
+        ⚠ The gate asks it to decide whether to wait a row, the read asks it to decide the branch. Two
+        copies of this arithmetic could disagree about which branch a run is on, which is precisely the
+        class of bug §30.1 collapsed the fork to prevent."""
+        usable = [row for row in decisions[self.__huntFrom:] if row.values]
+        if not usable:
+            return 0.0, usable, None
+        minimumIndex = min(range(len(usable)), key=lambda index: usable[index].get("qPercent"))
+        return (usable[0].get("qPercent") - usable[minimumIndex].get("qPercent")), usable, minimumIndex
+
+    def __readDiagnostics(self, usable, winner, depth):
+        """What the run says about ITSELF — recorded beside the answer, never folded into it (§29.5).
+
+        ⭐⭐ `browningPerMinute` is the damage banked between the moment that was READ and the end of the
+        run, as a TWO-POINT rate. ⛔ Not a least-squares slope: the two-point form is the damage that
+        actually happened, a fit is a model of it — and it is the form §29.1's table was measured with
+        (0.0495 · 0.0077 · 0.2909 · 0.0222 on the four clear runs; a fit drifts up to 5 %).
+        ⭐ §2 asked for exactly this shape — "reported SEPARATELY, never folded in" — and separate is what
+        makes it safe: the value is the least-damaged look, while the rate says how fast THIS fill was
+        degrading. A fill browning at 0.291 /min is a fill worth re-preparing, and until now that fact was
+        silently folded into the answer instead.
+        ⚠ IT IS AS AT PROMOTION, not for all time. In PRODUCT mode the run stops here so the tail is the
+        whole story; a DIAGNOSTIC run keeps observing afterwards and this number does not follow it.
+        ⚠ On the vertex branch only 2-4 rows follow the read (004: 4, 006: 2, 007: 3) ⇒ it is RECORDED,
+        never gated on, and `rowsAfterRead` travels with it so nobody reads a 2-row rate as a measurement.
+        """
+        tail = usable[usable.index(winner):]
+        minutes = (tail[-1].t - tail[0].t) / 60.0
+        rate = None if minutes <= 0 else \
+            (tail[-1].get("qPercent") - tail[0].get("qPercent")) / minutes
+        return {"depth": depth, "depthThreshold": self.depthThreshold,
+                "windowFrames": self.windowFrames, "readRule": self.version,
+                "browningPerMinute": rate, "rowsAfterRead": len(tail)}
 
     def __vertex(self, window):
         """The Q% minimum as a PARABOLA VERTEX through three decision rows (§2.2).
@@ -270,11 +424,22 @@ class ClearingEvaluator:
         # somebody writes down — and the settled value may differ by more than the gauge's own boundaries.
         fields = [("turbidity", "%.4f%s" % (latest.get("valley"),
                                             "" if rate is None else "  %+.4f/min" % rate))]
+        if self.windowFrames < self.SIGMA_REFERENCE_FRAMES:
+            # ⚠ §30.15: the depth threshold is CLAMPED below W = 60 rather than scaled, because scaling it
+            # up pushes runs onto the catastrophic branch. Safe, but not honest — so the operator is told
+            # they are outside the only window the noise was ever measured at.
+            fields.append(("window", "W = %d — below the validated 60" % self.windowFrames))
         if self.__reclouded and self.__gateIndex is None:
             return {"state": "re-clouded — warming again …", "progress": ("INDETERMINATE", None),
                     "fields": fields, "severity": "WARN"}
         if self.__gateIndex is not None:
             fields.append(("Q%", "%.1f" % latest.get("qPercent")))
+            if self.__branch is None:
+                # ⭐ §30/R1.5: the K4c wait says WHY it is waiting. The gate has fired, so "clearing …" is
+                # no longer true, but nothing has been read either — and an unexplained "settled" that
+                # sits there for several rows is the complaint §27.7 was written about.
+                return {"state": "settled — the minimum is still the newest look, waiting for its far side",
+                        "progress": ("INDETERMINATE", None), "fields": fields}
             return {"state": "settled — measuring", "progress": ("INDETERMINATE", None), "fields": fields}
         return {"state": "clearing …", "progress": ("INDETERMINATE", None), "fields": fields}
 
@@ -332,8 +497,10 @@ class DevSpectralPlugin(SpectralPlugin):
 
     # --- monitored acquisition (SPEC_settled_measurement.md §10.1a-bis) --------------------------------
 
-    MONITOR_WINDOW_FRAMES = 50     # ⭐ W. §14.2b: bigger is always better at fixed wall-clock, so W_gate = W
-    MONITOR_RETENTION_FRAMES = 60  # R = W + margin. ⛔ NOT sized by the run length — the winner is promoted out
+    # ⭐ W when the host does not pass one. ⛔ IT IS THE DECLARED BURST, NOT A SECOND NUMBER (§30.4): it
+    # used to be 50 against a declared FRAMES of 60, for no stated reason, and under the §29 read that gap
+    # was a 10 % looser depth threshold on any path that forgot to pass the combo value.
+    MONITOR_WINDOW_FRAMES = FRAMES  # §14.2b: bigger is always better at fixed wall-clock, so W_gate = W
     MONITOR_MAX_SECONDS = 1500.0   # 25 min (§12.2), chosen against the 17-min beam-clearing of 2026-08-14
 
     def createMonitor(self, reference=None, mode=None, frames=None):
@@ -349,10 +516,19 @@ class DevSpectralPlugin(SpectralPlugin):
         """
         if reference is None:
             return None
-        policy = MonitorPolicy(windowFrames=frames or self.MONITOR_WINDOW_FRAMES,
-                               retentionFrames=self.MONITOR_RETENTION_FRAMES,
+        # ⛔⛔ RETENTION IS DERIVED FROM THE WINDOW IN FORCE, NEVER PINNED (§30.13). It was the constant 60
+        # while `windowFrames` comes from the operator's Frames combo — so a plugin declaring FRAMES > 60
+        # (this file's own combo comment cites "the dev bench's 150") would leave the ring unable to fill
+        # a window, the engine's `len(window) >= minWindowFrames` never true, NO row ever emitted, and the
+        # run would burn the full 25-minute cap to finish NEVER_SETTLED with an empty trajectory.
+        # ⭐ `FrameRing`'s own default is exactly this rule — W + max(5, W // 5) — so passing None asks the
+        # part that owns the ring to size it.
+        window = frames or self.MONITOR_WINDOW_FRAMES
+        policy = MonitorPolicy(windowFrames=window, retentionFrames=None,
                                maxSeconds=self.MONITOR_MAX_SECONDS)
-        evaluator = ClearingEvaluator(self, reference, mode)
+        # ⭐ §30.4/R1.1: the evaluator is handed the window it is judging — its depth threshold is 2σ of
+        # ONE window, and W is a dropdown, not a constant.
+        evaluator = ClearingEvaluator(self, reference, mode, windowFrames=policy.windowFrames)
         return MonitorEngine(evaluator, FrameRing(policy.windowFrames, policy.retentionFrames), policy,
                              evaluatorId="dev-clearing", evaluatorVersion=evaluator.version)
 
@@ -380,14 +556,14 @@ class DevSpectralPlugin(SpectralPlugin):
         if answer.get("value") is not None:
             view.addHeaderField("Q%", "%.2f" % answer["value"])
             view.addHeaderField("read", "%s · %s" % (answer.get("readAs", "?"), answer.get("branch", "?")))
-            view.addHeaderField("at", "%.2f min" % (answer["t"] / 60.0))
+            view.addHeaderField("read at", "%.2f min" % (answer["t"] / 60.0))
             low, high = self.V_VERDICT_BAND
             # ⛔ §18.7: the 12-22 domain is a HEADER CHIP, not an axis level — drawn as levels it forces a
             # 10-unit axis around a 0.5-unit trajectory and flattens the trace into a line.
             view.addHeaderField("domain", "✓ in domain" if low <= answer["value"] <= high
                                 else "⛔ outside %g–%g — no verdict" % (low, high))
         if record.get("clearingSeconds") is not None:
-            view.addHeaderField("clearing", "%.2f min" % (record["clearingSeconds"] / 60.0))
+            view.addHeaderField("gate at", "%.2f min" % (record["clearingSeconds"] / 60.0))
 
         view.addPanel("qPercent", "Q%", scale="linear")
         view.addSeries("qPercent", minutes, [row.get("qPercent") for row in rows], "Q%", "#e08000")
@@ -415,7 +591,10 @@ class DevSpectralPlugin(SpectralPlugin):
             view.addLevel("rate", ClearingEvaluator.THETA_PER_MINUTE,
                           "settled below %g /min" % ClearingEvaluator.THETA_PER_MINUTE)
 
-        for panelKey in ("valley", "rate"):
+        # ⭐ THE Q% PANEL CARRIES THE GATE MARKER TOO (§30.10/R2.3). On the clear branch the green answer
+        # dot now sits at ~0.09 min while the gate fired at ~1.75 — the picture of §29 in one frame — and
+        # without the marker the reader sees only a dot at the far left with nothing to explain it.
+        for panelKey in ("qPercent", "valley", "rate"):
             if not any(panel["key"] == panelKey for panel in view.panels):
                 continue
             if record.get("clearingSeconds") is not None:
@@ -486,8 +665,9 @@ class DevSpectralPlugin(SpectralPlugin):
         outcome = record.get("outcome", "?")
         items.append(MetricFieldView(
             "Outcome", outcome,
-            "SETTLED_IMMEDIATE = the fill arrived clear · SETTLED_AFTER_CLEARING = it cleared in the beam "
-            "and the Q% minimum was read as a parabola vertex · NEVER_SETTLED / CANCELLED / "
+            "SETTLED_IMMEDIATE = the Q% curve never turned — no minimum deeper than this window's own "
+            "noise — so the FIRST look is the answer · SETTLED_AFTER_CLEARING = it turned, so the Q% "
+            "minimum was read as a parabola vertex · NEVER_SETTLED / CANCELLED / "
             "MEASUREMENT_BROKEN = ⛔ no value at all, and the curve tabs show why.",
             style=MetricFieldViewStyle.builder().labelBold(True).build()))
 
@@ -506,11 +686,16 @@ class DevSpectralPlugin(SpectralPlugin):
                 "verdict is drawn."))
             items.append(MetricFieldView(
                 "Read as", "%s · %s" % (answer.get("readAs", "?"), answer.get("branch", "?")),
-                "FIRST_SETTLED_WINDOW = the fill was flat from the start, so the first settled window IS "
-                "the answer. VERTEX = it was clearing, so the Q% minimum was read as a parabola through "
-                "its three neighbours — the raw minimum of noisy samples is biased low."))
-            items.append(MetricFieldView("Read at", "%.2f min" % (answer["t"] / 60.0),
-                                         "Time of the winning window's CENTRE, measured from the first frame."))
+                "FIRST_SETTLED_WINDOW = the curve showed no turning point deeper than noise, so the FIRST "
+                "look is the answer — it is the least-damaged one, because the lamp browns the sample for "
+                "as long as the gate keeps looking. VERTEX = it turned, so the Q% minimum was read as a "
+                "parabola through its three neighbours — the raw minimum of noisy samples is biased low."))
+            items.append(MetricFieldView(
+                "Read at", "%.2f min" % (answer["t"] / 60.0),
+                "Time of the winning window's CENTRE, measured from the first frame. ⚠ On the clear branch "
+                "this is EARLY — the first look, ~6 s in — while the gate went on confirming for another "
+                "minute or two. The two are different moments and the row below carries the other one."))
+            items.extend(self.__settlingDiagnosticFields(answer.get("diagnostics") or {}))
         else:
             items.append(MetricFieldView(
                 "Value", "— none —",
@@ -520,9 +705,11 @@ class DevSpectralPlugin(SpectralPlugin):
 
         if record.get("clearingSeconds") is not None:
             items.append(MetricFieldView(
-                "Clearing time", "%.2f min" % (record["clearingSeconds"] / 60.0),
-                "When the gate confirmed the fill had stopped clearing. ⭐ Logged with every measurement "
-                "because it is a σ_fill component, not a diagnostic curiosity."))
+                "Gate confirmed at", "%.2f min" % (record["clearingSeconds"] / 60.0),
+                "When the gate confirmed the fill had stopped clearing — ⛔ NOT when the answer was read. "
+                "⭐ Logged with every measurement because it is a σ_fill component, not a diagnostic "
+                "curiosity, and reading one of these two times for the other would build σ_fill on the "
+                "wrong quantity."))
         rows = record.get("rows") or []
         if rows:
             items.append(MetricFieldView("Decision rows", "%d" % len(rows),
@@ -557,6 +744,32 @@ class DevSpectralPlugin(SpectralPlugin):
                 "drifted is a run whose noise budget drifted with it."))
         for item in items:
             item.setShownInReport(True)
+        return items
+
+    @staticmethod
+    def __settlingDiagnosticFields(diagnostics):
+        """⭐ §29.5 — what the run says about ITSELF, beside the answer and never folded into it."""
+        items = []
+        rate = diagnostics.get("browningPerMinute")
+        if rate is not None:
+            items.append(MetricFieldView(
+                "Browning", "%+.3f /min  (%d rows)" % (rate, diagnostics.get("rowsAfterRead", 0)),
+                "How fast Q% was still rising AFTER the moment that was read — the photodamage this fill "
+                "was taking, measured rather than assumed. ⛔ Reported separately and NEVER folded into "
+                "the answer: the value is the least-damaged look, this says how fast that look was "
+                "decaying. Series F ran 0.008–0.291 /min between fills of the SAME evening — a factor of "
+                "35 — so there is no constant to subtract, and a fill browning fast is one worth "
+                "re-preparing. ⚠ On the vertex branch only 2–4 rows follow the read, so it is a "
+                "diagnostic, never a gate."))
+        if diagnostics.get("depth") is not None:
+            items.append(MetricFieldView(
+                "Curve depth", "%.3f  vs  %.3f threshold (W %s)"
+                % (diagnostics["depth"], diagnostics.get("depthThreshold", float("nan")),
+                   diagnostics.get("windowFrames", "?")),
+                "How far the Q% minimum sat below the FIRST look, against 2σ of one window's noise. ⭐ This "
+                "is what chose the read: below the line the curve never turned and the first look is "
+                "reported; above it, the minimum is real and the vertex is fitted. The threshold is "
+                "derived from the window size actually used, and clamped at its measured W = 60 value."))
         return items
 
     # Short tab labels for the per-graph tabs — the panel labels themselves carry units and are too long
