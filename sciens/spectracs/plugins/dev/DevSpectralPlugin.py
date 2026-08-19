@@ -69,6 +69,27 @@ class ClearingEvaluator:
     GATE_CONSECUTIVE = 2           # k_gate — two consecutive flat comparisons (TEST A)
     TREND_ROWS = 5                 # m — the re-clouding trend baseline (TEST B)
 
+    # ⭐⭐ TEST C — THE DEGRADING FILL (§31). A fill that RIPENS rather than re-clouds rises MONOTONICALLY
+    # at a rate far below θ: 0.0012/min measured on 20260819/001, against θ = 0.005. TEST A therefore calls
+    # it flat and TEST B stays silent, while `__hasFallenSinceMaximum` blocks the gate on every row and
+    # stalls the run WITHOUT A WORD — 12.6 minutes of lamp on a fill that was never going to settle, and it
+    # escaped only when the valley ticked down by 0.0001.
+    # ⛔⛔ DO NOT "FIX" THIS BY LOWERING θ. TEST B moves `huntFrom` (§30.8), which is right for a re-cloud
+    # and catastrophic for a ripening fill: it would march the hunt window forward behind the degradation,
+    # discarding the ONLY good look in the run. TEST C is the MIRROR IMAGE of TEST B, not another instance
+    # of it — same observable, opposite prognosis, opposite treatment of the earlier rows (§31.3).
+    # ⭐ SO TEST C HAS NO MAGNITUDE TERM AT ALL. θ answers "is this big?", which is the wrong question for a
+    # trend; significance answers "is this real?", and on 001 slope/stdErr ran 9-39 per window and 171 over
+    # the whole run while the slope never came near θ.
+    DEGRADE_TREND_ROWS = 10        # m_degrade — LONGER than TEST B's 5, so the two cannot be confused
+    DEGRADE_SIGMA = 4.0            # k_sig — stricter than TEST B's 2.0: this test ENDS a run
+    # ⚠ RELEVANCE, not significance — a second significance test would be redundant. With enough rows an
+    # arbitrarily small real drift becomes significant; this says "do not end a run over a rise that does
+    # not matter". ⚠ Reasoned, not measured: 001's rise across ten rows is 6.0 %, six times this floor, so
+    # the rule does not sit on this number.
+    DEGRADE_RISE_FRACTION = 0.01   # the rise across the baseline, as a fraction of A_valley now
+    DEGRADE_CONSECUTIVE = 2        # k_degrade — one window must not be able to end a run
+
     # ⛔⛔ `MATERIAL_FALL = 0.010` WAS DELETED HERE (§30.1). It asked "has A_valley fallen far enough to
     # call this fill 'was clearing'?" — i.e. it took the decision about HOW TO READ Q% from a DIFFERENT
     # QUANTITY. §29.2 moved that decision onto the curve being read, so the constant has no reader left,
@@ -105,6 +126,11 @@ class ClearingEvaluator:
         self.__gateIndex = None        # index into the decision rows where the gate fired
         self.__branch = None
         self.__reclouded = False
+        # ⭐ §31.6: TEST C's run of consecutive qualifying rows, and the latch that says the fill is going
+        # backwards. ⛔ `__degrading` NEVER moves `__huntFrom` — that is the single easiest mistake to make
+        # while implementing this beside TEST B, and it would throw away the answer.
+        self.__degradingRun = 0
+        self.__degrading = False
         # ⭐ §30.8: TEST B does not merely reset the GATE, it invalidates the HISTORY. Everything before a
         # re-clouding event belongs to a fill that was cloudier than the one now being measured, so the
         # minimum hunt — and "the first look" with it — starts again from there.
@@ -174,7 +200,18 @@ class ClearingEvaluator:
             # taken from the most turbid moment of the run — the exact value the algorithm exists to avoid
             # reporting. ⚠ Reasoned, not measured: none of the seven series F runs re-clouded.
             self.__huntFrom = len(decisions) - 1
+            # ⭐ §31.6 claim (2): a TEST B reset MUST zero TEST C's run. `huntFrom` has moved, so the
+            # baseline TEST C was fitting no longer describes the fill in the beam.
+            self.__degradingRun = 0
             note = "re-clouding — the gate and the hunt window were reset (§14.5 TEST B, §30.8)"
+        elif self.__isDegrading(decisions):
+            # ⭐ TEST C (§31.4): a SUSTAINED SIGNIFICANT RISE with no magnitude term. ⛔ It is an `elif` of
+            # TEST A on purpose: `__isFlat` asks one 70-second comparison and `__isDegrading` a ten-row fit,
+            # so BOTH can be true at once — and on 001 both were true for forty rows. Degradation must
+            # outrank flatness, or the gate wins the race on exactly the fill this test exists to catch.
+            self.__degradingRun += 1
+            note = ("A_valley is rising steadily — the fill may be coarsening rather than settling "
+                    "(§31 TEST C, %d/%d)" % (self.__degradingRun, self.DEGRADE_CONSECUTIVE))
         elif self.__isFlat(decisions):
             # ⭐ TEST A (§14.5): flatness is a MAGNITUDE question on a SHORT baseline. ⛔ The first draft
             # asked one comparison to answer both questions, and on an already-clear fill (true rate 0,
@@ -182,9 +219,21 @@ class ClearingEvaluator:
             self.__consecutiveFlat += 1
         else:
             self.__consecutiveFlat = 0
+            self.__degradingRun = 0
 
-        if self.__consecutiveFlat >= self.GATE_CONSECUTIVE and self.__hasFallenSinceMaximum(decisions):
-            return self.__fireGate(decisions)
+        # ⭐ TEST C is checked BEFORE the gate (§31.6 claim 3), so a degrading fill can never reach
+        # `__fireGate` and be read down the clearing path.
+        if self.__degradingRun >= self.DEGRADE_CONSECUTIVE:
+            return self.__fireDegraded(decisions)
+        if self.__consecutiveFlat >= self.GATE_CONSECUTIVE:
+            if self.__hasFallenSinceMaximum(decisions):
+                return self.__fireGate(decisions)
+            # ⚠ §31.8: THE GUARD MUST NOT STALL SILENTLY. It blocked run 001's gate for forty-two
+            # consecutive rows and the record said nothing about why — the 12.6 minutes had to be
+            # reconstructed from the trace afterwards. ⛔ The phrase must not contain "gate fired", which
+            # §14.3's acceptance test greps for.
+            note = note or ("gate held — A_valley's maximum is the newest look (%d rows), so nothing has "
+                            "settled yet (§31.8)" % len(decisions))
         return MonitorDecision.carryOn(note)
 
     # --- the gate ---------------------------------------------------------------------------------
@@ -232,6 +281,61 @@ class ClearingEvaluator:
         if slope is None:
             return False
         return slope > self.THETA_PER_MINUTE and slope > 2.0 * standardError
+
+    def __degradingTrend(self, decisions):
+        """The (slope, standardError, rise, window) of `A_valley` over TEST C's baseline — ⭐ ONE
+        computation, two callers: the test itself and the diagnostics it records.
+
+        ⭐⭐ THE BASELINE NEVER SPANS A RE-CLOUDING RESET. It starts at `max(huntFrom, ...)`, so the ten
+        rows always describe the fill currently in the beam (§31.6 claim 2). ⛔ Without that, for up to ten
+        rows after a TEST B event the fit would be measuring the cloud recovery and calling it ripening.
+        """
+        start = max(self.__huntFrom, len(decisions) - self.DEGRADE_TREND_ROWS)
+        window = [row for row in decisions[start:] if row.values]
+        if len(window) < self.DEGRADE_TREND_ROWS:
+            return None, None, None, window
+        times = [row.t / 60.0 for row in window]
+        values = [row.get("valley") for row in window]
+        slope, standardError = self.__slopeWithError(times, values)
+        return slope, standardError, values[-1] - values[0], window
+
+    def __isDegrading(self, decisions):
+        """⭐ TEST C (§31.4) — is this fill going BACKWARDS?
+
+        significance:  slope > DEGRADE_SIGMA * its own standard error   ⭐ the detector
+        relevance:     rise  >= DEGRADE_RISE_FRACTION * A_valley now    ⚠ a backstop, not a second test
+
+        ⛔ NO MAGNITUDE TERM. θ is what makes TEST B blind to this case, and copying it here would make
+        TEST C blind too — 0.0012/min is a quarter of θ and 171 standard errors from zero.
+        """
+        slope, standardError, rise, window = self.__degradingTrend(decisions)
+        if slope is None or slope <= 0 or standardError is None:
+            return False
+        if slope <= self.DEGRADE_SIGMA * standardError:
+            return False
+        current = abs(window[-1].get("valley"))
+        return rise >= self.DEGRADE_RISE_FRACTION * current
+
+    def __degradingDiagnostics(self, decisions):
+        """What a degrading run says about itself (§31.7) — recorded, never folded into the answer."""
+        slope, standardError, rise, window = self.__degradingTrend(decisions)
+        if slope is None:
+            return {}
+        current = abs(window[-1].get("valley"))
+        return {"degradingPerMinute": slope,
+                "degradingSignificance": None if not standardError else slope / standardError,
+                "degradingRisePercent": None if not current else 100.0 * rise / current,
+                "degradingRows": len(window)}
+
+    def __fireDegraded(self, decisions):
+        """⭐ TEST C fires: stop the looking, and hand the curve to the SAME read as everything else (§30.1).
+
+        ⛔ It does NOT invent its own read, and it does NOT touch `huntFrom`. It sets one latch; `__read`
+        does the rest, including the §31.5 refusal of the vertex.
+        """
+        self.__degrading = True
+        self.__gateIndex = len(decisions) - 1
+        return self.__read(decisions)
 
     def __hasFallenSinceMaximum(self, decisions):
         # ⚠ §14.5: never settle at the TOP of a re-clouding dip. A fill that is flat from the first row
@@ -301,17 +405,39 @@ class ClearingEvaluator:
             return MonitorDecision.carryOn()
         first = usable[0]
 
-        if depth < self.depthThreshold:
+        # ⛔⛔ §31.5 — THE VERTEX IS REFUSED ON A FILL WHOSE TURBIDITY NEVER FELL, AND THIS IS LOAD-BEARING.
+        # Run 001's Q% curve DOES have a turning point (13.585 -> 13.474 over seven rows, then up to
+        # 14.185) and its depth of 0.111 missed the 0.126 threshold by 12 %. Had it cleared, this read
+        # would have taken that vertex and called it the settled value. ⛔ On a fill that never cleared,
+        # that turning point is not a settling minimum: it is the CROSSOVER where rising turbidity and
+        # falling Soret happen to balance — the point where two contaminations cancel, not the point where
+        # either is smallest.
+        # ⭐ Conditional, NOT a blanket refusal: a fill that genuinely clears, reaches its minimum and THEN
+        # begins to ripen has a real vertex, and there TEST C's only job is to stop the run early and flag
+        # the sample. `A_valley`'s own argmin is what separates the two — the same quantity §29.2 moved
+        # AWAY from for the branch decision, used here for a different question: did it ever clear at all?
+        valleys = [row.get("valley") for row in usable]
+        valleyFell = len(valleys) > 1 and valleys.index(min(valleys)) > 0
+        degradedNeverCleared = self.__degrading and not valleyFell
+
+        if depth < self.depthThreshold or degradedNeverCleared:
             # ⭐ No turning point deeper than this window's own noise ⇒ nothing has happened since the
             # first look but photodamage, so the first look IS the least-damaged measurement of the run.
             self.__branch = "arrived-clear"
+            diagnostics = dict(self.__readDiagnostics(usable, first, depth), valleyFell=valleyFell)
+            if self.__degrading:
+                diagnostics.update(self.__degradingDiagnostics(decisions))
+                note = ("the fill is DEGRADING, not settling — A_valley rose throughout, so the FIRST "
+                        "look is the answer and a fresh dilution is needed (§31)")
+            else:
+                note = ("settled — no turning point deeper than %.3f, so the FIRST look is the answer"
+                        % self.depthThreshold)
             return MonitorDecision(
                 promote=True, stop=self.mode == MonitorMode.PRODUCT,
-                outcome=MonitorOutcome.SETTLED_IMMEDIATE, branch=self.__branch,
-                readAs="FIRST_SETTLED_WINDOW", promoteRow=first,
-                diagnostics=self.__readDiagnostics(usable, first, depth),
-                note="settled — no turning point deeper than %.3f, so the FIRST look is the answer"
-                     % self.depthThreshold)
+                outcome=MonitorOutcome.DEGRADING_FILL if self.__degrading
+                else MonitorOutcome.SETTLED_IMMEDIATE,
+                branch=self.__branch, readAs="FIRST_SETTLED_WINDOW", promoteRow=first,
+                diagnostics=diagnostics, note=note)
 
         if minimumIndex == len(usable) - 1:
             # The minimum is still the newest row: it may yet fall further, so wait for its right-hand
@@ -330,11 +456,19 @@ class ClearingEvaluator:
         self.__branch = "was-clearing"
         winner = usable[minimumIndex]
         window = usable[max(0, minimumIndex - 1):minimumIndex + 2]
+        # ⭐ §31.5's other half: a fill that CLEARED and then began to ripen keeps its vertex. The outcome
+        # still says DEGRADING_FILL, because that is why the run ended and the operator must hear it.
+        diagnostics = dict(self.__readDiagnostics(usable, winner, depth), valleyFell=valleyFell)
+        if self.__degrading:
+            diagnostics.update(self.__degradingDiagnostics(decisions))
         return MonitorDecision(promote=True, stop=self.mode == MonitorMode.PRODUCT,
-                               outcome=MonitorOutcome.SETTLED_AFTER_CLEARING, branch=self.__branch,
+                               outcome=MonitorOutcome.DEGRADING_FILL if self.__degrading
+                               else MonitorOutcome.SETTLED_AFTER_CLEARING, branch=self.__branch,
                                readAs="VERTEX", answer=self.__vertex(window), promoteRow=winner,
-                               diagnostics=self.__readDiagnostics(usable, winner, depth),
-                               note="settled — read as a parabola vertex")
+                               diagnostics=diagnostics,
+                               note="the fill cleared, then began DEGRADING — read as a parabola vertex, "
+                                    "and a fresh dilution is needed (§31.5)" if self.__degrading
+                               else "settled — read as a parabola vertex")
 
     def __depthOf(self, decisions):
         """How far below its FIRST look the `Q%` minimum sits — ⭐ ONE computation, two callers.
@@ -432,6 +566,12 @@ class ClearingEvaluator:
         if self.__reclouded and self.__gateIndex is None:
             return {"state": "re-clouded — warming again …", "progress": ("INDETERMINATE", None),
                     "fields": fields, "severity": "WARN"}
+        # ⭐ §31.7: the operator hears it as soon as TEST C latches, not only in the record afterwards.
+        if self.__degrading:
+            if latest.get("qPercent") is not None:
+                fields.append(("Q%", "%.1f" % latest.get("qPercent")))
+            return {"state": "⚠ the fill is getting cloudier, not clearer — reading now",
+                    "progress": ("INDETERMINATE", None), "fields": fields, "severity": "WARN"}
         if self.__gateIndex is not None:
             fields.append(("Q%", "%.1f" % latest.get("qPercent")))
             if self.__branch is None:
@@ -667,7 +807,9 @@ class DevSpectralPlugin(SpectralPlugin):
             "Outcome", outcome,
             "SETTLED_IMMEDIATE = the Q% curve never turned — no minimum deeper than this window's own "
             "noise — so the FIRST look is the answer · SETTLED_AFTER_CLEARING = it turned, so the Q% "
-            "minimum was read as a parabola vertex · NEVER_SETTLED / CANCELLED / "
+            "minimum was read as a parabola vertex · ⚠ DEGRADING_FILL = A_valley rose steadily instead of "
+            "falling, so the sample was coarsening rather than settling: the value stands (the earliest "
+            "look is the least contaminated one) but PREPARE A FRESH DILUTION · NEVER_SETTLED / CANCELLED / "
             "MEASUREMENT_BROKEN = ⛔ no value at all, and the curve tabs show why.",
             style=MetricFieldViewStyle.builder().labelBold(True).build()))
 
