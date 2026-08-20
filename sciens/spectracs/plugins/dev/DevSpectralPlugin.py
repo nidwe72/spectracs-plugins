@@ -38,10 +38,15 @@ class ClearingEvaluator:
     """
 
     # ⭐ §29.6/§30.12: the READ RULE's version, stamped into every record as `evaluatorVersion`. 1.0 read
-    # the look at which the gate finished confirming; 2.0 reads the first look unless the curve turned.
+    # the look at which the gate finished confirming; 2.0 reads the first look unless the curve turned;
+    # ⭐ 3.0 reads at the END of the run and refuses a minimum the curve later fell below (§40, §43/RD1).
     # ⛔ It changes what four of the seven series F runs would report ⇒ any recomputation of archived
     # numbers must be able to say which rule produced them, and this is how it says so.
-    version = "clearing-2.0"
+    # ⚠⚠ AND IT MUST BE BUMPED WHEN THE READ CHANGES — WHICH TEST C DID NOT DO, and the replay harness
+    # found it on its first run (§51): 20260818A/001 is stamped `clearing-2.0` and prints 28.321 (a VERTEX),
+    # but today's 2.0 replays it to 28.569 (the first look), because TEST C landed on 2026-08-19 under the
+    # same string. ⇒ "clearing-2.0" identifies two different algorithms in the archive.
+    version = "clearing-3.0"
     valueKey = "qPercent"
 
     # ⭐ Every constant here is the PLUGIN's. None of them appear in the SDK (§10.2).
@@ -108,6 +113,31 @@ class ClearingEvaluator:
     DEPTH_SIGMA_MULTIPLE = 2.0     # 2σ. ⚠ §29.6: the min of n noisy looks sits ~0.9σ low at n=7 by chance
                                    # alone and ~1.5σ at n=20, so 1σ would promote noise to a vertex.
 
+    # ⭐⭐⭐ THE DRAWDOWN RULE (SPEC_settled_measurement.md §40) — Edwin's reading of run 006's plot,
+    # formalised: **a settling minimum is the point after which the curve only goes UP.** If it comes back
+    # down, something other than browning was still happening and it was not the minimum.
+    #
+    # drawdown(i) = the largest FALL-BACK from a running maximum over the rows AFTER i, judged against the
+    # run's OWN noise floor. On 006 the shipped read took the bottom of a noise excursion — 18.989 against a
+    # settled plateau of 19.873, a 0.884 error — and the excursion is exactly the thing this sees:
+    #
+    #     legitimate minima, ten runs :  drawdown  0.0 - 2.8 x tailSd
+    #     006's spurious dip          :            39.8 x tailSd
+    #     -> a 14x gap; ANY multiple between 3 and 39 gives identical answers on the whole archive.
+    #
+    # ⛔⛔ IT IS AN END-OF-RUN READ AND CANNOT DRIVE A GATE (§40.5): both `drawdown` and `tailSd` are defined
+    # over the rows AFTER a candidate, so neither exists while the run is in progress. That is why it lives
+    # in `finalize()` — and why §34's fixed duration is its natural partner rather than a separate idea.
+    # ⚠ §48.3: eight of thirteen archived runs have FEWER THAN FOUR rows after their chosen minimum, six of
+    # them scoring 0.0000 — admissible by ABSENCE of evidence. `rowsAfterMinimum` is recorded so a 0.0000
+    # from one row can never be mistaken for a 0.0000 from nineteen.
+    DRAWDOWN_TAIL_MULTIPLE = 10.0  # mid-gap between the 2.8x of a real minimum and the 39.8x of a spurious one
+    TAIL_ROWS = 8                  # the window `tailSd` is measured over — every number in §40 used eight
+    # ⭐ A2/§45-M4 (Edwin, 2026-08-20): a short run still gets an answer, and says how short its tail was.
+    # 4-7 rows -> use what there is and record `tailRows`; fewer than 4 -> no drawdown test is possible, so
+    # fall back to the pre-§40 read rather than refusing a fill on the strength of nothing.
+    MIN_TAIL_ROWS = 4
+
     def __init__(self, plugin, reference, mode=None, windowFrames=None):
         self.__plugin = plugin
         self.__reference = reference
@@ -124,6 +154,7 @@ class ClearingEvaluator:
         self.depthThreshold = self.depthThresholdFor(self.windowFrames)
         self.__consecutiveFlat = 0
         self.__gateIndex = None        # index into the decision rows where the gate fired
+        self.__gateSeconds = None      # ...and WHEN, which a finalize-time read would otherwise lose (RD2)
         self.__branch = None
         self.__reclouded = False
         # ⭐ §31.6: TEST C's run of consecutive qualifying rows, and the latch that says the fill is going
@@ -165,9 +196,35 @@ class ClearingEvaluator:
         container.addToSpectra(spectrum, SAMPLE)
         return self.__plugin.monitorMetrics(container)     # ⭐ the plugin's OWN public metric (§10.3)
 
+    # ⭐⭐ THE END-OF-RUN SEAM (SPEC_settled_measurement.md §43/RD1, §46/B3). `decide()` is asked only while
+    # frames arrive; `MonitorEngine.__finish()` asks this ONCE, when no more data can come.
+    # ⛔⛔ IT MAY REVISE THE LATCHED ANSWER, AND THAT IS AN AMENDMENT TO §14.6 (§48.2). The latch exists so
+    # that WATCHING a run cannot move its number; one deliberate re-read after the last frame is a different
+    # act, and it is never invisible — the record carries `readPhase`, `gateAnswer` and `gateSeconds`.
+    # ⚠ Which endings reach it is the ENGINE's business (§48.1): stop and the caps do, a cancel and a
+    # failure do not, a stall does but keeps its outcome.
+    def finalize(self, rows):
+        """Read the FINISHED curve. Returns a promoting decision, or None to leave the gate's answer alone."""
+        decisions = self.__usableDecisions(rows)
+        if len(decisions) < 3:
+            return None                      # nothing a vertex could be fitted through
+        return self.__read(decisions, final=True)
+
+    def __usableDecisions(self, rows):
+        # ⭐ D1: a `tooDark` row is not a look (§43/RD3). It is dropped here, FIRST, so nothing downstream —
+        # not the trend tests, not the hunt, not the vertex — can ever see one.
+        return [row for row in rows
+                if row.isDecisionRow and not row.provisional and not row.get("tooDark")]
+
     def decide(self, rows):
-        decisions = [row for row in rows if row.isDecisionRow and not row.provisional]
+        decisions = self.__usableDecisions(rows)
         if not decisions:
+            # ⛔ D1/§32.4a: "no usable rows" is NOT "the measurement is broken". A fill that is still too
+            # dark to read is still clearing, and aborting it is the §32.2 defect in a new place. The abort
+            # below counts rows whose values are genuinely EMPTY; a tooDark row never reaches it.
+            if self.__tooDarkOnly(rows):
+                return MonitorDecision.carryOn(
+                    "too dark to read — the fill is still clearing (§32.4a)")
             return MonitorDecision.carryOn()
         latest = decisions[-1]
 
@@ -335,6 +392,7 @@ class ClearingEvaluator:
         """
         self.__degrading = True
         self.__gateIndex = len(decisions) - 1
+        self.__gateSeconds = decisions[-1].t
         return self.__read(decisions)
 
     def __hasFallenSinceMaximum(self, decisions):
@@ -356,6 +414,7 @@ class ClearingEvaluator:
         ⭐ Turbidity now answers only "when to stop looking"; the shape of the curve being read answers
         "what to report"."""
         self.__gateIndex = len(decisions) - 1
+        self.__gateSeconds = decisions[-1].t          # ⭐ §43/RD2 — see `__provenance`
         # ⛔⛔ THE VERTEX BRANCH STILL WAITS ONE ROW AT THE GATE (§14.4) — AND THE ARCHIVE IS WHY.
         # The first cut of §30 read at the gate row on BOTH branches, which looked like free dose. Replaying
         # run 006 refuted it: its gate fires at 279.5 s, and at that instant the deepest look so far is
@@ -378,9 +437,82 @@ class ClearingEvaluator:
 
     # --- the read (§29.3, ordered per §30.3) ------------------------------------------------------
 
-    def __read(self, decisions):
+    # --- the drawdown rule (§40) ------------------------------------------------------------------
+
+    @classmethod
+    def tailSd(cls, times, values):
+        """The run's OWN noise floor: residual scatter of the last rows about a straight line.
+
+        ⭐ A LINE, not a mean — a settled tail is usually browning gently, and a mean would score that slope
+        as noise. Returns (sd, rowsUsed), or (None, n) when there is not enough tail to measure one.
+        ⭐ PUBLIC: the read judges with it and the record reports it, so the two cannot disagree."""
+        rows = min(cls.TAIL_ROWS, len(times))
+        if rows < cls.MIN_TAIL_ROWS:
+            return None, rows
+        t, y = numpy.array(times[-rows:], dtype=float) / 60.0, numpy.array(values[-rows:], dtype=float)
+        if not numpy.all(numpy.isfinite(t)) or not numpy.all(numpy.isfinite(y)) or len(set(t)) < 3:
+            return None, rows
+        residual = y - numpy.polyval(numpy.polyfit(t, y, 1), t)
+        sd = float(numpy.sqrt(numpy.sum(residual ** 2) / max(1, rows - 2)))
+        return (sd if sd > 0 else None), rows
+
+    @staticmethod
+    def drawdownAfter(values, index):
+        """The largest fall from a running maximum over the rows AFTER `index` — ⭐ §40.2.
+
+        ⚠ Zero rows after means zero drawdown, which is admissible by ABSENCE of evidence (§48.3). The
+        caller records `rowsAfterMinimum` beside it so nobody can mistake the two."""
+        after = numpy.array(values[index + 1:], dtype=float)
+        if len(after) < 2:
+            return 0.0, len(after)
+        return float(numpy.max(numpy.maximum.accumulate(after) - after)), len(after)
+
+    def __admissibleMinimum(self, usable):
+        """The DEEPEST interior local minimum the curve never came back down from — §40.2.
+
+        Returns (index, diagnostics). `index` is None when no candidate is admissible, which is the correct
+        ending for a fill that never settled: run 003's deepest minimum sits at 41.5 x tailSd and the rule
+        refuses it, where the shipped read reported 8.450 (§40.4).
+        """
+        times = [row.t for row in usable]
+        values = [row.get("qPercent") for row in usable]
+        sd, tailRows = self.tailSd(times, values)
+        if sd is None:
+            # ⚠ A2: fewer than MIN_TAIL_ROWS — no yardstick exists, so fall back rather than refuse.
+            return "FALLBACK", {"tailSd": None, "tailRows": tailRows}
+        candidates = [i for i in range(1, len(values) - 1)
+                      if values[i] <= values[i - 1] and values[i] <= values[i + 1]]
+        scored, admissible = [], []
+        for i in candidates:
+            fall, after = self.drawdownAfter(values, i)
+            scored.append({"t": times[i], "value": values[i], "drawdown": fall,
+                           "drawdownTails": fall / sd, "rowsAfterMinimum": after})
+            if fall <= self.DRAWDOWN_TAIL_MULTIPLE * sd:
+                admissible.append(i)
+        diagnostics = {"tailSd": sd, "tailRows": tailRows, "candidates": len(candidates),
+                       "rejected": [s for s in scored
+                                    if s["drawdownTails"] > self.DRAWDOWN_TAIL_MULTIPLE]}
+        if not candidates:
+            # ⭐⭐ NO TURNING POINT AT ALL IS NOT A REFUSAL — it is the ARRIVED-CLEAR case, and the depth
+            # test below owns it (§29.3). ⛔ Conflating the two refused Lugitsch 003 and Billa 002, two
+            # perfectly good monotone runs, the first time the harness ran. Only a curve that HAS turning
+            # points and has every one of them rejected has failed to settle.
+            return "FALLBACK", diagnostics
+        if not admissible:
+            return None, diagnostics
+        best = min(admissible, key=lambda i: values[i])
+        chosen = [s for s in scored if s["t"] == times[best]][0]
+        diagnostics.update(drawdown=chosen["drawdown"], drawdownTails=chosen["drawdownTails"],
+                           rowsAfterMinimum=chosen["rowsAfterMinimum"])
+        return best, diagnostics
+
+    def __read(self, decisions, final=False):
         """How far below its FIRST look does the `Q%` minimum sit? — asked at the gate row and at every
         decision row after it, until it answers.
+
+        ⭐ `final=True` is the END-OF-RUN read (§43/RD1): the same rules, plus §40's drawdown admissibility,
+        which can only be evaluated once no more rows can arrive. ⛔ `decide()` never passes it, so every
+        existing test of the gate-time read is untouched (§43/RD6).
 
         ⭐⭐ DEPTH FIRST, AND THE ORDER IS LOAD-BEARING (§30.3). §29.3 listed the interior test first; read
         that way, a SHALLOW minimum that happens to sit on the newest row also waits — and if noise keeps
@@ -404,6 +536,25 @@ class ClearingEvaluator:
         if not usable:
             return MonitorDecision.carryOn()
         first = usable[0]
+        drawdown = {}
+
+        # ⭐⭐⭐ §40 — ON THE END-OF-RUN READ, THE MINIMUM MUST BE ONE THE CURVE NEVER CAME BACK DOWN FROM.
+        # ⚠ It only ever moves the choice; the branch logic below is unchanged, which is what let §46/B3
+        # land as a pure refactor with all sixteen archived answers reproduced before this ran at all.
+        if final:
+            chosen, drawdown = self.__admissibleMinimum(usable)
+            if chosen is None:
+                # ⛔ NO ANSWER. Every turning point the curve has is one it later fell below, so none of
+                # them is a settling minimum — the fill did not settle inside this run. §40.4: this is what
+                # refuses run 003, where the shipped read reported 8.450 off the dark floor.
+                return MonitorDecision(
+                    withdraw=True, outcome=MonitorOutcome.NEVER_SETTLED,
+                    diagnostics=self.__provenance({}, final, drawdown),
+                    note="no admissible minimum — every turning point was followed by a further fall, so "
+                         "this fill never settled (§40)")
+            if chosen != "FALLBACK":
+                minimumIndex = chosen
+                depth = first.get("qPercent") - usable[minimumIndex].get("qPercent")
 
         # ⛔⛔ §31.5 — THE VERTEX IS REFUSED ON A FILL WHOSE TURBIDITY NEVER FELL, AND THIS IS LOAD-BEARING.
         # Run 001's Q% curve DOES have a turning point (13.585 -> 13.474 over seven rows, then up to
@@ -424,7 +575,8 @@ class ClearingEvaluator:
             # ⭐ No turning point deeper than this window's own noise ⇒ nothing has happened since the
             # first look but photodamage, so the first look IS the least-damaged measurement of the run.
             self.__branch = "arrived-clear"
-            diagnostics = dict(self.__readDiagnostics(usable, first, depth), valleyFell=valleyFell)
+            diagnostics = self.__provenance(
+                dict(self.__readDiagnostics(usable, first, depth), valleyFell=valleyFell), final, drawdown)
             if self.__degrading:
                 diagnostics.update(self.__degradingDiagnostics(decisions))
                 note = ("the fill is DEGRADING, not settling — A_valley rose throughout, so the FIRST "
@@ -433,7 +585,7 @@ class ClearingEvaluator:
                 note = ("settled — no turning point deeper than %.3f, so the FIRST look is the answer"
                         % self.depthThreshold)
             return MonitorDecision(
-                promote=True, stop=self.mode == MonitorMode.PRODUCT,
+                promote=True, stop=(not final) and self.mode == MonitorMode.PRODUCT,
                 outcome=MonitorOutcome.DEGRADING_FILL if self.__degrading
                 else MonitorOutcome.SETTLED_IMMEDIATE,
                 branch=self.__branch, readAs="FIRST_SETTLED_WINDOW", promoteRow=first,
@@ -458,10 +610,11 @@ class ClearingEvaluator:
         window = usable[max(0, minimumIndex - 1):minimumIndex + 2]
         # ⭐ §31.5's other half: a fill that CLEARED and then began to ripen keeps its vertex. The outcome
         # still says DEGRADING_FILL, because that is why the run ended and the operator must hear it.
-        diagnostics = dict(self.__readDiagnostics(usable, winner, depth), valleyFell=valleyFell)
+        diagnostics = self.__provenance(
+            dict(self.__readDiagnostics(usable, winner, depth), valleyFell=valleyFell), final, drawdown)
         if self.__degrading:
             diagnostics.update(self.__degradingDiagnostics(decisions))
-        return MonitorDecision(promote=True, stop=self.mode == MonitorMode.PRODUCT,
+        return MonitorDecision(promote=True, stop=(not final) and self.mode == MonitorMode.PRODUCT,
                                outcome=MonitorOutcome.DEGRADING_FILL if self.__degrading
                                else MonitorOutcome.SETTLED_AFTER_CLEARING, branch=self.__branch,
                                readAs="VERTEX", answer=self.__vertex(window), promoteRow=winner,
@@ -469,6 +622,27 @@ class ClearingEvaluator:
                                note="the fill cleared, then began DEGRADING — read as a parabola vertex, "
                                     "and a fresh dilution is needed (§31.5)" if self.__degrading
                                else "settled — read as a parabola vertex")
+
+    def __provenance(self, diagnostics, final, drawdown):
+        """⭐ WHICH READ PRODUCED THIS NUMBER, and what the gate had said before it (§45/M7, §48.2).
+
+        ⛔⛔ `readPhase` is not decoration. §45/M2: the finalize seam spans two repos joined only by
+        PYTHONPATH, and an old core with a new plugin fails SILENTLY — the probe finds nothing, the run
+        reverts to the gate-time answer, and on 006 the number goes quietly back to 18.989. A record that
+        says "gate" when the operator expected "final" names that skew instantly.
+        ⭐ `gateSeconds` is here because §43/RD2: the engine sets `clearingSeconds` at PROMOTION, so under a
+        finalize-time read it degenerates into the run length and §2.4's σ_fill component stops being logged.
+        """
+        diagnostics = dict(diagnostics, readPhase="final" if final else "gate")
+        if self.__gateIndex is not None and self.__gateSeconds is not None:
+            diagnostics["gateSeconds"] = self.__gateSeconds
+        diagnostics.update(drawdown or {})
+        return diagnostics
+
+    @staticmethod
+    def __tooDarkOnly(rows):
+        looks = [row for row in rows if row.isDecisionRow and not row.provisional]
+        return bool(looks) and all(row.get("tooDark") for row in looks)
 
     def __depthOf(self, decisions):
         """How far below its FIRST look the `Q%` minimum sits — ⭐ ONE computation, two callers.
@@ -502,9 +676,67 @@ class ClearingEvaluator:
         minutes = (tail[-1].t - tail[0].t) / 60.0
         rate = None if minutes <= 0 else \
             (tail[-1].get("qPercent") - tail[0].get("qPercent")) / minutes
-        return {"depth": depth, "depthThreshold": self.depthThreshold,
-                "windowFrames": self.windowFrames, "readRule": self.version,
-                "browningPerMinute": rate, "rowsAfterRead": len(tail)}
+        diagnostics = {"depth": depth, "depthThreshold": self.depthThreshold,
+                       "windowFrames": self.windowFrames, "readRule": self.version,
+                       "browningPerMinute": rate, "rowsAfterRead": len(tail)}
+        diagnostics.update(self.__stateAtRead(usable, winner))
+        return diagnostics
+
+    # ⭐⭐ W1 + W4 (SPEC_settled_measurement.md §46/A3-A4) — WHAT THE RUN KNEW ABOUT ITSELF WHEN IT ANSWERED.
+    # ⛔ Recorded, never gated on. Every number here was already in memory; none of it costs a record key, a
+    # result field or a migration, because it rides inside `answer["diagnostics"]` (§30/R2.1, §45/RD8).
+    def __stateAtRead(self, usable, winner):
+        """The three BAND RATES, `clearingObserved`, the answer's own turbidity, and the reference's level.
+
+        ⭐⭐ W1 IS THE HIGHEST VALUE-PER-LINE CHANGE IN THE WHOLE §42 LIST, and §33.4 is why: at the row each
+        archived run was READ, **nine of twelve were still clearing at 1-5 %/min in at least one band** —
+        and nothing in the record said so. One line would have told Edwin not to trust 19.867 on the evening
+        he measured it.
+
+        ⚠ RELATIVE (%/min), not absolute. `THETA_PER_MINUTE` is an absolute threshold on the SMALLEST of the
+        three bands, which is exactly the defect §33.4 named: `A_valley` reaches 0.005/min while `A_Soret` is
+        still shedding twice as much absorbance per minute. Reporting %/min is what makes the three
+        comparable — and it is a DIAGNOSTIC here, not a gate (C5 stays deferred, §42.8).
+        """
+        state = {}
+        last = usable[-1]
+        for key, label in (("soret", "soretPercentPerMinute"),
+                           ("valley", "valleyPercentPerMinute"),
+                           ("qBand", "qBandPercentPerMinute")):
+            rate = self.rateAt([row.t for row in usable], [row.get(key) for row in usable], len(usable) - 1)
+            level = last.get(key)
+            state[label] = None if rate is None or not level else 100.0 * rate / level
+        # ⭐ W4: how much clearing this fill actually DEMONSTRATED, as a fraction of where it started.
+        # 002: 1.6 %. 003: 97.8 %. Lugitsch: 1-7 %. ⛔ NOT a gate — §32.5 measured that the level and the
+        # fall are only diagnostic as a PAIR, and no threshold is derivable from the archive yet.
+        firstValley, lastValley = usable[0].get("valley"), last.get("valley")
+        state["clearingObserved"] = None if not firstValley else (firstValley - lastValley) / firstValley
+        # ⭐ W4: the clearing state the answer was taken AT. §37.4 — the answer sits at the Q% minimum, i.e.
+        # a DIFFERENT turbidity for every fill (sd 0.0398 against the last row's 0.0182), so any comparison
+        # between two runs' spectra needs this number to know whether it is comparing like with like.
+        state["valleyAtRead"] = winner.get("valley")
+        state["valleyAtEnd"] = lastValley
+        state.update(self.__referenceLevels())
+        return state
+
+    def __referenceLevels(self):
+        """The reference's own band means — ⭐ P7 (§38.6).
+
+        ⚠ It was read as a one-way warm-up in §36.6 and downgraded to a ±3 % WANDER in §38.6 once there were
+        seven of them (valley-band means 148.4 · 141.4 · 140.0 · 142.8 · 141.9 · 147.8 · 144.7, no trend) —
+        which fits re-seating the reference jar every run better than it fits the lamp. ⛔ Either way it was
+        INVISIBLE in the record, so a run whose reference sat at the edge of the spread could not be
+        recognised as suspect afterwards. Three numbers fix that.
+        """
+        if self.__plugin is None or self.__reference is None:
+            return {}
+        try:
+            util = SpectrumFeatureUtil()
+            return {"referenceSoret": util.bandMean(self.__reference, *self.__plugin.V_SORET_BAND),
+                    "referenceValley": util.bandMean(self.__reference, *self.__plugin.V_VALLEY_BAND),
+                    "referenceQ": util.bandMean(self.__reference, *self.__plugin.V_Q_BAND)}
+        except Exception:
+            return {}                       # ⛔ a diagnostic may never break a read (§25/X5's rule, locally)
 
     def __vertex(self, window):
         """The Q% minimum as a PARABOLA VERTEX through three decision rows (§2.2).
@@ -549,9 +781,19 @@ class ClearingEvaluator:
     # --- what the operator sees (§13.3) -----------------------------------------------------------
 
     def coach(self, rows):
-        decisions = [row for row in rows if row.isDecisionRow and row.values]
+        decisions = [row for row in rows if row.isDecisionRow and row.values and not row.get("tooDark")]
         if not decisions:
-            return {"state": "starting …", "progress": ("INDETERMINATE", None), "fields": []}
+            # ⭐ D3 (§46) — the run is not silent while the fill is unreadable. ⛔ And the bar stays
+            # INDETERMINATE here even under a planned duration (§49/F2): a fill that has produced no metric
+            # at all gives the operator nothing to watch converge, so a filling bar would be theatre.
+            if any(row.isDecisionRow and row.get("tooDark") for row in rows):
+                return {"state": "too dark to read — the fill is still clearing",
+                        "progress": ("INDETERMINATE", None), "indeterminate": True,
+                        "fields": [("A_Soret", "> %.1f — beyond the sensor's range"
+                                    % getattr(self._ClearingEvaluator__plugin, "MONITOR_SORET_CEILING", 1.5))],
+                        "severity": "WARN"}
+            return {"state": "starting …", "progress": ("INDETERMINATE", None),
+                    "indeterminate": True, "fields": []}
         latest = decisions[-1]
         rate = self.__rate(decisions, len(decisions) - 1)
         # ⛔ §17/U1: NO provisional Q% is shown. A number displayed while it is still moving is a number
@@ -642,6 +884,15 @@ class DevSpectralPlugin(SpectralPlugin):
     # was a 10 % looser depth threshold on any path that forgot to pass the combo value.
     MONITOR_WINDOW_FRAMES = FRAMES  # §14.2b: bigger is always better at fixed wall-clock, so W_gate = W
     MONITOR_MAX_SECONDS = 1500.0   # 25 min (§12.2), chosen against the 17-min beam-clearing of 2026-08-14
+    # ⭐⭐ THE PLANNED DURATION (Edwin, §34; landed as §46/E5). Every fill gets the SAME DOSE, which deletes
+    # §2.4's varying-clearing-time term from sigma_fill — the archive spans 98 s to 893 s of lamp, a 9x
+    # spread that §2.4 counts as noise — and it guarantees the browning limb has time to CONFIRM the
+    # minimum: run 001 outlasted its own minimum by ONE ROW, 9.5 seconds.
+    # ⚠ THE NUMBER IS PROVISIONAL until §33.8's T0 (one fill driven to completion, 60 min, plus a shuttered
+    # arm). It is a constant here and a setting at the bench precisely so that shipping it does not pretend
+    # it was derived. The three minima the archive holds land at 3.9 / 9.0 / 13.5 min; 15 would have been
+    # marginal for 001, 20 covers all three with margin.
+    MONITOR_PLANNED_SECONDS = 1200.0   # 20 min
 
     def createMonitor(self, reference=None, mode=None, frames=None):
         """ASSEMBLE the monitor: an SDK engine + an SDK ring + ⭐ THIS PLUGIN'S OWN evaluator.
@@ -663,9 +914,19 @@ class DevSpectralPlugin(SpectralPlugin):
         # run would burn the full 25-minute cap to finish NEVER_SETTLED with an empty trajectory.
         # ⭐ `FrameRing`'s own default is exactly this rule — W + max(5, W // 5) — so passing None asks the
         # part that owns the ring to size it.
+        # ⛔⛔ §45/M2 + §48.2 — REFUSE A CORE THAT CANNOT ASK THE LAST QUESTION. The five repos are joined
+        # only by PYTHONPATH, so an old `spectracsPy-core` with this plugin is not an error: the engine's
+        # probe finds no `finalize`, the end-of-run read never runs, and the answer silently reverts to the
+        # gate's (on run 006, 19.782 quietly becoming 18.989). Failing here costs one run's setup; failing
+        # silently costs a measurement nobody knows to distrust.
+        if not getattr(MonitorEngine, "SUPPORTS_FINALIZE", False):
+            raise RuntimeError(
+                "this plugin's read is an END-OF-RUN read and needs MonitorEngine.SUPPORTS_FINALIZE — "
+                "spectracsPy-core is older than spectracs-plugins (SPEC_settled_measurement.md §45/M2)")
         window = frames or self.MONITOR_WINDOW_FRAMES
         policy = MonitorPolicy(windowFrames=window, retentionFrames=None,
-                               maxSeconds=self.MONITOR_MAX_SECONDS)
+                               maxSeconds=self.MONITOR_MAX_SECONDS,
+                               plannedSeconds=self.MONITOR_PLANNED_SECONDS)
         # ⭐ §30.4/R1.1: the evaluator is handed the window it is judging — its depth threshold is 2σ of
         # ONE window, and W is a dropdown, not a constant.
         evaluator = ClearingEvaluator(self, reference, mode, windowFrames=policy.windowFrames)
@@ -704,6 +965,32 @@ class DevSpectralPlugin(SpectralPlugin):
                                 else "⛔ outside %g–%g — no verdict" % (low, high))
         if record.get("clearingSeconds") is not None:
             view.addHeaderField("gate at", "%.2f min" % (record["clearingSeconds"] / 60.0))
+
+        # ⭐⭐ W1 (§46/A3) — THE HIGHEST VALUE-PER-LINE CHANGE IN THE WHOLE PLAN, and §33.4 is why: at the row
+        # each archived run was read, NINE OF TWELVE were still clearing at 1-5 %/min in at least one band,
+        # and the record said nothing. One line would have told Edwin not to trust 19.867 on the evening he
+        # measured it. ⛔ Reported, never gated on — C5's relative-rate GATE stays deferred (§42.8).
+        diagnostics = answer.get("diagnostics") or {}
+        rates = [(label, diagnostics.get(key)) for label, key in
+                 (("A_Soret", "soretPercentPerMinute"), ("A_valley", "valleyPercentPerMinute"),
+                  ("A_Q", "qBandPercentPerMinute"))]
+        if any(rate is not None for _, rate in rates):
+            settled = all(rate is not None and abs(rate) < 1.0 for _, rate in rates)
+            view.addHeaderField(
+                "settled?" if settled else "⚠ still clearing",
+                "  ".join("%s %+.2f %%/min" % (label, rate) for label, rate in rates if rate is not None))
+        if diagnostics.get("clearingObserved") is not None:
+            view.addHeaderField("cleared by", "%.1f %% of its own A_valley"
+                                % (100.0 * diagnostics["clearingObserved"]))
+        if diagnostics.get("readPhase"):
+            # ⛔ §45/M2 — "gate" here on a run that should have read at the end is a REPO SKEW, not a quirk.
+            audit = diagnostics["readPhase"]
+            if diagnostics.get("gateAnswer") is not None:
+                audit += "  (the gate had said %.2f)" % diagnostics["gateAnswer"]
+            if diagnostics.get("drawdownTails") is not None:
+                audit += "  ·  drawdown %.1f x tailSd over %s rows" % (
+                    diagnostics["drawdownTails"], diagnostics.get("rowsAfterMinimum", "?"))
+            view.addHeaderField("read", audit)
 
         view.addPanel("qPercent", "Q%", scale="linear")
         view.addSeries("qPercent", minutes, [row.get("qPercent") for row in rows], "Q%", "#e08000")
@@ -1163,6 +1450,15 @@ class DevSpectralPlugin(SpectralPlugin):
     # 0.334, so this only fires on a broken capture. ⚠ It withholds rather than clamps: a clamped pill is a
     # lie with a number. ⭐ Verified on real data: it fires on all 27 runs of the 20260806A NULL SERIES.
     V_SORET_FLOOR = 0.15
+    # ⭐⭐ THE MONITOR'S CEILING (SPEC_settled_measurement.md §32.4, §46/D1) — the OTHER end of the floor
+    # above, and it did not exist. Run 003's first look reported `A_Soret = 2.979`: the sample transmitted
+    # 0.105 % of the reference, i.e. 0.02-0.05 DN against a reference in its 20-50 DN target — **below one
+    # code of an 8-bit sensor**. Twenty-one of its forty-six rows were arithmetic on the dark floor, and the
+    # read took the first of them (8.450 against a true ~20.3).
+    # ⛔⛔ IT IS ITS OWN CONSTANT, NOT `VALUE_CEILING` (§45/M6). That one drops saturated λ INSIDE a band
+    # computation; this one asks "is this whole row a measurement?" — a different question that will want to
+    # move independently the first time either is re-derived. Same 1.5 today.
+    MONITOR_SORET_CEILING = 1.5
     # §3.1a — the DOMAIN of the verdict, and a SECOND guard on the same withhold-don't-clamp principle.
     # A gauge CLAMPS a value past its band edge (GaugeColorUtil, RD#5) — so without this, `Q%` = 39.90 draws
     # a confident "probably too brown" and `Q%` = -28.34 draws "good — green", on samples the metric has no
@@ -1870,6 +2166,14 @@ class DevSpectralPlugin(SpectralPlugin):
         if terms is None:
             return {}
         soret, valley, qBand, qPercent = terms
+        if soret > self.MONITOR_SORET_CEILING:
+            # ⭐⭐ TOO DARK TO READ — and ⛔⛔ NOT the same as `{}` (§32.4a). A sub-floor Soret means there is
+            # nothing in the cuvette and the run must ABORT; an over-ceiling Soret means the cuvette is full
+            # of a fill that is still clearing and the run must WAIT. Represented as `{}` they are
+            # indistinguishable, and run 003 would abort at t ~ 40 s as MEASUREMENT_BROKEN — a different
+            # wrong answer, arrived at faster.
+            # ⚠ `soret` rides along deliberately: the record then shows HOW dark, not merely that it was.
+            return {"tooDark": 1.0, "soret": soret}
         return {"qPercent": qPercent, "soret": soret, "valley": valley, "qBand": qBand}
 
     def __vTerms(self, despikedAbsorption):
